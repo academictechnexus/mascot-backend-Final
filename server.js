@@ -17,16 +17,13 @@ const openai = new OpenAI({
 });
 
 // --- Middleware ---
-app.use(cors({
-  origin: [
-    "https://yourfrontenddomain.com",   // replace with your Vercel custom domain
-    "https://www.yourfrontenddomain.com"
-  ],
-  methods: ["GET", "POST"],
-}));
+app.use(cors()); // allow all origins for now (can restrict later)
 app.use(express.json());
 app.use(helmet());
 app.use(morgan("dev"));
+
+// Trust proxy (fixes rate-limit warning on Railway/Vercel)
+app.set("trust proxy", 1);
 
 // Rate limiting (100 requests / 15 min per IP)
 const limiter = rateLimit({
@@ -38,7 +35,9 @@ app.use(limiter);
 // --- Extra debug logging ---
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
-  if (req.body) console.log("Body:", req.body);
+  if (req.body && Object.keys(req.body).length > 0) {
+    console.log("Body:", req.body);
+  }
   next();
 });
 
@@ -53,7 +52,11 @@ async function trackOrder(orderId) {
   return `Order ${orderId} is being processed.`;
 }
 
-// --- /api/chat ---
+// --- /api/chat (POST = real chat, GET = debug) ---
+app.get("/api/chat", (req, res) => {
+  res.json({ message: "This is the chat endpoint. Use POST with { message: '...' }" });
+});
+
 app.post("/api/chat", async (req, res) => {
   try {
     const { message } = req.body;
