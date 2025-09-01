@@ -1,146 +1,112 @@
-// server.js
-// Fresh backend: Health, OpenAI chat, mascot upload (local), safe defaults.
-
 const express = require("express");
 const cors = require("cors");
+const morgan = require("morgan");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const axios = require("axios");
-const morgan = require("morgan");
-const multer = require("multer");
-const fs = require("fs");
-const path = require("path");
-require("dotenv").config();
+const dotenv = require("dotenv");
+const { Configuration, OpenAIApi } = require("openai");
+
+dotenv.config();
 
 const app = express();
+const PORT = process.env.PORT || 3000;
 
-// ---------- Config ----------
-const PORT = process.env.PORT || 8080;
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
+// --- OpenAI Setup ---
+const configuration = new Configuration({
+  apiKey: process.env.OPENAI_API_KEY,
+});
+const openai = new OpenAIApi(configuration);
 
-// ---------- Middlewares ----------
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    crossOriginResourcePolicy: { policy: "cross-origin" },
-  })
-);
-app.use(express.json({ limit: "1mb" }));
+// --- Middleware ---
+app.use(cors({
+  origin: [
+    "https://yourfrontenddomain.com",   // replace with your Vercel domain
+    "https://www.yourfrontenddomain.com"
+  ],
+  methods: ["GET", "POST"],
+}));
+app.use(express.json());
+app.use(helmet());
+app.use(morgan("dev"));
 
-// TEMP: allow all origins (works everywhere). Tighten later with an allowlist.
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
-
-// Logging (no bodies)
-morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
-app.use(morgan(":reqid :method :url :status - :response-time ms", { skip: r => r.path === "/health" }));
-
-// Rate limit just the AI & upload endpoints
+// Rate limiting (100 requests per 15 min per IP)
 const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10),
-  max: parseInt(process.env.RATE_LIMIT_MAX || "8", 10),
-  standardHeaders: true,
-  legacyHeaders: false,
+  windowMs: 15 * 60 * 1000,
+  max: 100
 });
-app.use("/chat", limiter);
-app.use("/mascot/upload", limiter);
+app.use(limiter);
 
-// ---------- Health ----------
-app.get("/", (_req, res) => res.status(200).send("OK"));
-app.get("/health", (_req, res) =>
-  res.json({ ok: true, service: "mascot-backend", time: new Date().toISOString() })
-);
-
-// ---------- Diagnostics ----------
-app.get("/openai/ping", async (_req, res) => {
-  try {
-    if (!OPENAI_API_KEY) return res.status(500).json({ ok: false, detail: "OPENAI_API_KEY not set" });
-    const r = await axios.get("https://api.openai.com/v1/models", {
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      timeout: 10000,
-    });
-    res.json({ ok: true, count: r.data?.data?.length || 0 });
-  } catch (e) {
-    const status = e?.response?.status || 500;
-    const detail = e?.response?.data || e.message;
-    res.status(status).json({ ok: false, detail });
-  }
+// --- Logging requests manually (extra debug) ---
+app.use((req, res, next) => {
+  console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
+  if (req.body) console.log("Body:", req.body);
+  next();
 });
 
-// Helpful message if someone GETs /chat in a browser
-app.get("/chat", (_req, res) =>
-  res.status(405).json({ error: "Use POST /chat", example: { message: "Hello" } })
-);
+// --- Shopify stubs (replace later with real Shopify API) ---
+async function getProducts(query) {
+  return [
+    { name: "Demo Shoe", price: "$49.99" },
+    { name: "Demo Sneaker", price: "$39.99" }
+  ];
+}
+async function trackOrder(orderId) {
+  return `Order ${orderId} is being processed.`;
+}
 
-// ---------- Chat (OpenAI) ----------
-const SYSTEM_PROMPT =
-  "You are Academic Technexus's helpful assistant. Be concise, friendly, and safe.";
-
-app.post("/chat", async (req, res) => {
+// --- /api/chat ---
+app.post("/api/chat", async (req, res) => {
   try {
-    const userMessage = (req.body?.message || "").toString().trim();
-    if (!userMessage) return res.status(400).json({ error: "Missing 'message' in body." });
+    const { message } = req.body;
+    if (!message) return res.status(400).json({ error: "Message is required" });
 
-    if (!OPENAI_API_KEY) {
-      return res.status(500).json({ reply: "⚠️ Server not configured with OPENAI_API_KEY." });
+    let botReply;
+
+    if (message.toLowerCase().includes("order")) {
+      botReply = await trackOrder("12345");
+    } else if (message.toLowerCase().includes("shoe") || message.toLowerCase().includes("sneaker")) {
+      const products = await getProducts(message);
+      botReply = "Here are some products:\n" + products.map(p => `${p.name} - ${p.price}`).join("\n");
+    } else {
+      // General GPT reply
+      const completion = await openai.createChatCompletion({
+        model: "gpt-4o-mini",
+        messages: [{ role: "user", content: message }],
+      });
+      botReply = completion.data.choices[0].message.content;
     }
 
-    const ai = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          { role: "user", content: userMessage },
-        ],
-        temperature: 0.6,
-        max_tokens: 500,
-      },
-      {
-        timeout: 20000,
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-        },
-      }
-    );
-
-    const reply = ai?.data?.choices?.[0]?.message?.content?.trim() || "Sorry, I couldn’t generate a response.";
-    res.json({ reply });
+    res.json({ text: botReply });
   } catch (err) {
-    const status = err?.response?.status || 502;
-    const code = err?.response?.data?.error?.code;
-    const friendly =
-      code === "insufficient_quota"
-        ? "⚠️ Demo usage limit reached. Please try again later."
-        : "⚠️ I’m having trouble reaching the AI service. Please try again.";
-    console.error("OpenAI /chat error:", err?.response?.data || err.message);
-    res.status(status).json({ reply: friendly });
+    console.error("Error in /api/chat:", err.response ? err.response.data : err.message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ---------- Mascot Upload (local storage) ----------
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
-app.use("/uploads", express.static(UPLOAD_DIR));
-
-app.post("/mascot/upload", upload.single("mascot"), (req, res) => {
+// --- /api/tts ---
+app.post("/api/tts", async (req, res) => {
   try {
-    if (!req.file) return res.status(400).json({ success: false, error: "No file uploaded. Field name 'mascot'." });
-    const safeName = `${Date.now()}_${(req.file.originalname || "mascot").replace(/[^\w.-]/g, "_")}`;
-    fs.writeFileSync(path.join(UPLOAD_DIR, safeName), req.file.buffer);
-    return res.json({ success: true, url: `/uploads/${safeName}` });
-  } catch (e) {
-    console.error("Upload error:", e.message);
-    return res.status(500).json({ success: false, error: "Upload failed." });
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: "Text is required" });
+
+    const response = await openai.createSpeech({
+      model: "gpt-4o-mini-tts",
+      voice: "alloy",
+      input: text,
+    });
+
+    const buffer = Buffer.from(response.data, "base64");
+    res.setHeader("Content-Type", "audio/mpeg");
+    res.send(buffer);
+  } catch (err) {
+    console.error("Error in /api/tts:", err.response ? err.response.data : err.message);
+    res.status(500).json({ error: "Internal server error" });
   }
 });
 
-// ---------- Start ----------
-app.listen(PORT, () => console.log(`✅ Secure server running on port ${PORT}`));
+// --- Health check ---
+app.get("/", (req, res) => res.send("✅ Shop Assistant API running"));
+
+app.listen(PORT, () => {
+  console.log(`🚀 Server running on port ${PORT}`);
+});
