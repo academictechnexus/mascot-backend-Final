@@ -4,7 +4,7 @@ const morgan = require("morgan");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
 const dotenv = require("dotenv");
-const { Configuration, OpenAIApi } = require("openai");
+const OpenAI = require("openai");
 
 dotenv.config();
 
@@ -12,15 +12,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 // --- OpenAI Setup ---
-const configuration = new Configuration({
+const openai = new OpenAI({
   apiKey: process.env.OPENAI_API_KEY,
 });
-const openai = new OpenAIApi(configuration);
 
 // --- Middleware ---
 app.use(cors({
   origin: [
-    "https://yourfrontenddomain.com",   // replace with your Vercel domain
+    "https://yourfrontenddomain.com",   // replace with your Vercel custom domain
     "https://www.yourfrontenddomain.com"
   ],
   methods: ["GET", "POST"],
@@ -29,14 +28,14 @@ app.use(express.json());
 app.use(helmet());
 app.use(morgan("dev"));
 
-// Rate limiting (100 requests per 15 min per IP)
+// Rate limiting (100 requests / 15 min per IP)
 const limiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 100
 });
 app.use(limiter);
 
-// --- Logging requests manually (extra debug) ---
+// --- Extra debug logging ---
 app.use((req, res, next) => {
   console.log(`[${new Date().toISOString()}] ${req.method} ${req.url}`);
   if (req.body) console.log("Body:", req.body);
@@ -69,16 +68,16 @@ app.post("/api/chat", async (req, res) => {
       botReply = "Here are some products:\n" + products.map(p => `${p.name} - ${p.price}`).join("\n");
     } else {
       // General GPT reply
-      const completion = await openai.createChatCompletion({
+      const completion = await openai.chat.completions.create({
         model: "gpt-4o-mini",
         messages: [{ role: "user", content: message }],
       });
-      botReply = completion.data.choices[0].message.content;
+      botReply = completion.choices[0].message.content;
     }
 
     res.json({ text: botReply });
   } catch (err) {
-    console.error("Error in /api/chat:", err.response ? err.response.data : err.message);
+    console.error("Error in /api/chat:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
@@ -89,17 +88,17 @@ app.post("/api/tts", async (req, res) => {
     const { text } = req.body;
     if (!text) return res.status(400).json({ error: "Text is required" });
 
-    const response = await openai.createSpeech({
+    const speech = await openai.audio.speech.create({
       model: "gpt-4o-mini-tts",
       voice: "alloy",
       input: text,
     });
 
-    const buffer = Buffer.from(response.data, "base64");
+    const buffer = Buffer.from(await speech.arrayBuffer());
     res.setHeader("Content-Type", "audio/mpeg");
     res.send(buffer);
   } catch (err) {
-    console.error("Error in /api/tts:", err.response ? err.response.data : err.message);
+    console.error("Error in /api/tts:", err);
     res.status(500).json({ error: "Internal server error" });
   }
 });
