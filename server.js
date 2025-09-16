@@ -1,18 +1,13 @@
 /**
- * server.js (updated)
- * - Provides /api/message and /api/lead to match the frontend widget
- * - Uses fetch-based OpenAI REST calls (no SDK) to avoid version mismatches
- * - Optional ElevenLabs TTS: returns data:audio/... base64 audio as ttsUrl when available
- * - Simple leads persistence to file + optional Slack notification
- *
- * Environment variables:
- *  OPENAI_API_KEY
- *  OPENAI_MODEL (optional, default: "gpt-4o-mini")
- *  ELEVENLABS_API_KEY (optional)
- *  ELEVENLABS_VOICE (optional, voice id)
- *  SLACK_WEBHOOK_URL (optional)
- *  BASE_URL (optional)
- *  ALLOWED_ORIGINS (optional, comma-separated)
+ * server.js (final replacement)
+ * - REST-based OpenAI calls (no SDK) to avoid version mismatch issues
+ * - Optional ElevenLabs TTS (returns base64 data URL)
+ * - Endpoints used by widget:
+ *    POST /api/message  -> { text, ttsUrl }
+ *    POST /api/lead     -> { id }
+ *    POST /mascot/upload
+ *    POST /api/chat     -> legacy
+ * - Saves leads to leads.json, chat logs to chatlogs/*.jsonl
  */
 
 const express = require("express");
@@ -27,47 +22,50 @@ const fs = require("fs");
 
 dotenv.config();
 
+// ---------- tolerant env resolution ----------
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_KEY || process.env.OPENAI;
+const OPENAI_MODEL = process.env.OPENAI_MODEL || process.env.OPENAI_MODEL_NAME || "gpt-4o-mini";
+const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.ELEVENLABS_KEY || process.env.ELEVENLABS;
+const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE || process.env.ELEVEN_VOICE || "alloy";
+const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL || process.env.SLACK_WEBHOOK || process.env.SLACK_WEBHOOK_URL;
+const BASE_URL = process.env.BASE_URL || "";
+const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || "";
+const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || process.env.UPLOAD_MAX || String(2 * 1024 * 1024), 10);
+const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "12", 10);
+const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10);
+const PLACEHOLDER_GLB = process.env.PLACEHOLDER_GLB || "https://models.readyplayer.me/68b5e67fbac430a52ce1260e.glb";
+
+// Node fetch
+const fetchFn = global.fetch.bind(global);
+
+// ---------- app setup ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Built-in fetch in Node 18+; use globally
-const fetchFn = global.fetch.bind(global);
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || "gpt-4o-mini";
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY;
-const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE || "alloy";
-const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL || process.env.SLACK_WEBHOOK;
-const PLACEHOLDER_GLB = process.env.PLACEHOLDER_GLB || "https://models.readyplayer.me/68b5e67fbac430a52ce1260e.glb";
-
-// ---- Basic middlewares ----
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
-
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// Rate limiter
-const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10),
-  max: parseInt(process.env.RATE_LIMIT_MAX || "12", 10),
-});
-app.use(limiter);
+// rate limiter
+app.use(rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX
+}));
 
-// CORS
-const allowedOriginsEnv = process.env.ALLOWED_ORIGINS || "";
-const allowedOrigins = allowedOriginsEnv.split(",").map(s => s.trim()).filter(Boolean);
-const corsOptions = {
-  origin: function (origin, callback) {
+// cors
+const allowedOriginsList = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+app.use(cors({
+  origin: function(origin, callback) {
     if (!origin) return callback(null, true);
-    if (allowedOrigins.length === 0) return callback(null, true);
-    if (allowedOrigins.indexOf(origin) !== -1) return callback(null, true);
+    if (allowedOriginsList.length === 0) return callback(null, true);
+    if (allowedOriginsList.indexOf(origin) !== -1) return callback(null, true);
     return callback(new Error("CORS error: origin not allowed"));
   },
-  credentials: true,
-};
-app.use(cors(corsOptions));
+  credentials: true
+}));
 
-// Uploads
+// uploads
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -76,22 +74,21 @@ const storage = multer.diskStorage({
   filename: (req, file, cb) => {
     const safe = Date.now() + "-" + file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
     cb(null, safe);
-  },
+  }
 });
 const upload = multer({
   storage,
-  limits: { fileSize: parseInt(process.env.MAX_UPLOAD_BYTES || (2 * 1024 * 1024), 10) },
+  limits: { fileSize: MAX_UPLOAD_BYTES },
   fileFilter: (req, file, cb) => {
     if (!file.mimetype.startsWith("image/")) return cb(new Error("Only image files are allowed"));
     cb(null, true);
-  },
+  }
 });
-
 app.use("/uploads", express.static(UPLOAD_DIR, { index: false }));
 
-// ---------------- utilities ----------------
+// ---------- helpers ----------
 function getBaseUrl(req) {
-  if (process.env.BASE_URL) return process.env.BASE_URL.replace(/\/$/, "");
+  if (BASE_URL) return BASE_URL.replace(/\/$/, "");
   const proto = req.headers["x-forwarded-proto"] || req.protocol;
   const host = req.headers["x-forwarded-host"] || req.get("host");
   return `${proto}://${host}`;
@@ -101,19 +98,33 @@ function rndId(prefix = "id") {
   return prefix + "_" + Math.random().toString(36).slice(2, 9);
 }
 
-// Simple append-to-file leads store (not heavy-duty, but okay for demo)
+// leads persistence
 const LEADS_FILE = path.join(__dirname, "leads.json");
 function saveLeadToFile(lead) {
-  const exists = fs.existsSync(LEADS_FILE);
-  if (!exists) fs.writeFileSync(LEADS_FILE, "[]");
-  const raw = fs.readFileSync(LEADS_FILE, "utf8");
-  let arr = [];
-  try { arr = JSON.parse(raw || "[]"); } catch (e) { arr = []; }
-  arr.push(lead);
-  fs.writeFileSync(LEADS_FILE, JSON.stringify(arr, null, 2));
+  try {
+    if (!fs.existsSync(LEADS_FILE)) fs.writeFileSync(LEADS_FILE, "[]", "utf8");
+    const raw = fs.readFileSync(LEADS_FILE, "utf8") || "[]";
+    const arr = JSON.parse(raw);
+    arr.push(lead);
+    fs.writeFileSync(LEADS_FILE, JSON.stringify(arr, null, 2), "utf8");
+  } catch (e) {
+    console.warn("saveLeadToFile failed:", e);
+  }
 }
 
-// ---------- OpenAI helper (fetch-based) ----------
+// chat log append
+function appendChatLog(entry) {
+  try {
+    const dir = path.join(__dirname, "chatlogs");
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const file = path.join(dir, `${new Date().toISOString().slice(0,10)}.jsonl`);
+    fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
+  } catch (e) {
+    console.warn("appendChatLog failed:", e);
+  }
+}
+
+// ---------- OpenAI REST helper ----------
 async function callOpenAIChat({ messages, model = OPENAI_MODEL, max_tokens = 800, timeoutMs = 60000 }) {
   if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not configured");
   const controller = new AbortController();
@@ -123,14 +134,10 @@ async function callOpenAIChat({ messages, model = OPENAI_MODEL, max_tokens = 800
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
+        "Authorization": `Bearer ${OPENAI_API_KEY}`
       },
-      body: JSON.stringify({
-        model,
-        messages,
-        max_tokens,
-      }),
-      signal: controller.signal,
+      body: JSON.stringify({ model, messages, max_tokens }),
+      signal: controller.signal
     });
     clearTimeout(id);
     if (!resp.ok) {
@@ -139,8 +146,7 @@ async function callOpenAIChat({ messages, model = OPENAI_MODEL, max_tokens = 800
       err.status = resp.status;
       throw err;
     }
-    const data = await resp.json();
-    return data;
+    return await resp.json();
   } catch (err) {
     clearTimeout(id);
     throw err;
@@ -151,57 +157,50 @@ async function callOpenAIChat({ messages, model = OPENAI_MODEL, max_tokens = 800
 async function callElevenLabsTTS(text) {
   if (!ELEVENLABS_API_KEY) return null;
   try {
-    // NOTE: ElevenLabs API may have different endpoints/params depending on your account.
-    // This is a generic approach: POST text, receive audio bytes.
-    // Adjust the endpoint/voice id as per your ElevenLabs account docs.
+    // ElevenLabs endpoint may vary; this is a generic POST flavor.
     const endpoint = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVENLABS_VOICE)}`;
-    const resp = await fetchFn(endpoint, {
+    const r = await fetchFn(endpoint, {
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY,
+        "xi-api-key": ELEVENLABS_API_KEY
       },
-      body: JSON.stringify({ text }),
+      body: JSON.stringify({ text })
     });
-    if (!resp.ok) {
-      const body = await resp.text();
-      console.warn("ElevenLabs TTS error:", resp.status, body);
+    if (!r.ok) {
+      const body = await r.text();
+      console.warn("ElevenLabs TTS error:", r.status, body);
       return null;
     }
-    const arrayBuffer = await resp.arrayBuffer();
-    const base64 = Buffer.from(arrayBuffer).toString("base64");
-    // Return data URL (audio/mpeg is a safe generic type; some APIs return wav/ogg)
+    const buffer = await r.arrayBuffer();
+    const base64 = Buffer.from(buffer).toString("base64");
     return `data:audio/mpeg;base64,${base64}`;
-  } catch (err) {
-    console.warn("ElevenLabs TTS call failed:", err);
+  } catch (e) {
+    console.warn("callElevenLabsTTS failed:", e);
     return null;
   }
 }
 
-// ================ Routes ==================
+// ---------- Routes ----------
 
-// Health
+// health
 app.get("/", (req, res) => res.json({ status: "ok", message: "Shop Assistant API running" }));
 
-// mascot upload (kept from original)
+// mascot upload
 app.post("/mascot/upload", upload.single("mascot"), async (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ error: "No file uploaded" });
     const base = getBaseUrl(req);
     const uploaded_image_url = `${base}/uploads/${req.file.filename}`;
     const glb_url = PLACEHOLDER_GLB;
-    return res.json({
-      uploaded_image_url,
-      glb_url,
-      note: "demo: placeholder GLB returned. Replace with your 2D->3D generator result",
-    });
+    return res.json({ uploaded_image_url, glb_url, note: "placeholder GLB returned (demo)" });
   } catch (err) {
     console.error("upload error:", err);
     return res.status(500).json({ error: "upload failed" });
   }
 });
 
-// Legacy /api/chat kept for backward compatibility — returns same shape as demo earlier
+// legacy /api/chat (kept)
 app.post("/api/chat", async (req, res) => {
   try {
     const { message } = req.body || {};
@@ -224,7 +223,6 @@ app.post("/api/chat", async (req, res) => {
         return res.json({ reply: replyText, action });
       } catch (err) {
         console.error("OpenAI error (api/chat):", err);
-        // fall through to demo fallback
       }
     }
 
@@ -234,6 +232,7 @@ app.post("/api/chat", async (req, res) => {
     else if (action === "walk") reply = "Taking a short walk... 🚶";
     else if (action === "wave") reply = "Waving hello! 👋";
     else reply = "Thanks! I heard you — this is a demo reply.";
+
     return res.json({ reply, action });
   } catch (err) {
     console.error("/api/chat error:", err);
@@ -241,14 +240,12 @@ app.post("/api/chat", async (req, res) => {
   }
 });
 
-// NEW: /api/message used by frontend widget I provided
-// Accepts: { sessionId, text }  -> returns { text, ttsUrl }
+// NEW: /api/message for widget
 app.post("/api/message", async (req, res) => {
   try {
     const { sessionId, text } = req.body || {};
     if (!text || String(text).trim().length === 0) return res.status(400).json({ error: "No text provided" });
 
-    // Build messages for OpenAI
     const messages = [
       { role: "system", content: "You are a helpful Shopify app developer assistant. Keep replies short and actionable." },
       { role: "user", content: String(text) }
@@ -264,30 +261,22 @@ app.post("/api/message", async (req, res) => {
         replyText = null;
       }
     }
+    if (!replyText) replyText = `Demo reply: ${String(text).slice(0, 200)}`;
 
-    if (!replyText) {
-      // demo fallback
-      replyText = `Demo reply: ${String(text).slice(0, 200)}`;
-    }
-
-    // Optionally generate TTS using ElevenLabs (returns data:audio/... base64)
+    // TTS
     let ttsUrl = null;
     if (ELEVENLABS_API_KEY) {
       try {
         ttsUrl = await callElevenLabsTTS(replyText);
-      } catch (err) {
-        console.warn("TTS generation failed:", err);
+      } catch (e) {
+        console.warn("TTS failed:", e);
         ttsUrl = null;
       }
     }
 
-    // Save basic chat log (non-blocking)
+    // save chat log (non-blocking)
     try {
-      const chatLogDir = path.join(__dirname, "chatlogs");
-      if (!fs.existsSync(chatLogDir)) fs.mkdirSync(chatLogDir, { recursive: true });
-      const file = path.join(chatLogDir, `${new Date().toISOString().slice(0,10)}.jsonl`);
-      const entry = { id: rndId("chat"), sessionId: sessionId || null, text: text, reply: replyText, created_at: new Date().toISOString() };
-      fs.appendFileSync(file, JSON.stringify(entry) + "\n");
+      appendChatLog({ id: rndId("chat"), sessionId: sessionId || null, text, reply: replyText, created_at: new Date().toISOString() });
     } catch (e) {
       console.warn("could not save chat log:", e);
     }
@@ -299,9 +288,7 @@ app.post("/api/message", async (req, res) => {
   }
 });
 
-// NEW: /api/lead used by frontend widget I provided
-// Accepts: { name, email, need, storeUrl, message }
-// Returns: { id }
+// NEW: /api/lead
 app.post("/api/lead", async (req, res) => {
   try {
     const { name, email, need, storeUrl, message } = req.body || {};
@@ -317,14 +304,9 @@ app.post("/api/lead", async (req, res) => {
       created_at: new Date().toISOString()
     };
 
-    // persist lead
-    try {
-      saveLeadToFile(lead);
-    } catch (e) {
-      console.warn("couldn't persist lead locally:", e);
-    }
+    try { saveLeadToFile(lead); } catch (e) { console.warn("persist lead failed:", e); }
 
-    // notify Slack if configured (best-effort)
+    // notify slack if available
     if (SLACK_WEBHOOK) {
       try {
         await fetchFn(SLACK_WEBHOOK, {
@@ -344,10 +326,8 @@ app.post("/api/lead", async (req, res) => {
   }
 });
 
-// Health
+// final health
 app.get("/health", (req, res) => res.json({ status: "ok" }));
 
-// Start server
-app.listen(PORT, () => {
-  console.log(`🚀 Server running on port ${PORT}`);
-});
+// start
+app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
