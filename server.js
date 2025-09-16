@@ -1,13 +1,29 @@
 /**
- * server.js (final replacement)
- * - REST-based OpenAI calls (no SDK) to avoid version mismatch issues
- * - Optional ElevenLabs TTS (returns base64 data URL)
- * - Endpoints used by widget:
+ * server.js (patched: trust-proxy + robust CORS)
+ *
+ * - Trusts proxy headers (app.set('trust proxy', 1)) for correct rate-limiter behavior behind Railway/Vercel.
+ * - Robust CORS handling; supports ALLOWED_ORIGINS, BASE_URL, and .vercel.app previews.
+ * - Uses fetch-based OpenAI REST calls (no SDK) to avoid version mismatch problems.
+ * - Optional ElevenLabs TTS support (returns data:audio/... base64 ttsUrl).
+ * - Endpoints:
  *    POST /api/message  -> { text, ttsUrl }
  *    POST /api/lead     -> { id }
  *    POST /mascot/upload
- *    POST /api/chat     -> legacy
- * - Saves leads to leads.json, chat logs to chatlogs/*.jsonl
+ *    POST /api/chat     -> legacy compatibility
+ *    GET  /, /health
+ *
+ * Env variables supported (tolerant mapping):
+ *  OPENAI_API_KEY | OPENAI_KEY | OPENAI
+ *  OPENAI_MODEL
+ *  ELEVENLABS_API_KEY | ELEVENLABS_KEY | ELEVENLABS
+ *  ELEVENLABS_VOICE | ELEVEN_VOICE
+ *  SLACK_WEBHOOK_URL | SLACK_WEBHOOK
+ *  BASE_URL
+ *  ALLOWED_ORIGINS (comma-separated)
+ *  MAX_UPLOAD_BYTES
+ *  RATE_LIMIT_MAX
+ *  RATE_LIMIT_WINDOW_MS
+ *  PLACEHOLDER_GLB
  */
 
 const express = require("express");
@@ -35,37 +51,61 @@ const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "12", 10);
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10);
 const PLACEHOLDER_GLB = process.env.PLACEHOLDER_GLB || "https://models.readyplayer.me/68b5e67fbac430a52ce1260e.glb";
 
-// Node fetch
-const fetchFn = global.fetch.bind(global);
+// Node fetch (global available in Node 18+)
+const fetchFn = global.fetch ? global.fetch.bind(global) : (async () => { throw new Error("global fetch not available"); });
 
 // ---------- app setup ----------
 const app = express();
 const PORT = process.env.PORT || 3000;
+
+// Trust proxy so Express reads X-Forwarded-* headers (required behind Railway/Vercel proxies)
+app.set('trust proxy', 1);
 
 app.use(helmet());
 app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// rate limiter
+// rate limiter - attach after trust proxy
 app.use(rateLimit({
   windowMs: RATE_LIMIT_WINDOW_MS,
   max: RATE_LIMIT_MAX
 }));
 
-// cors
+// Robust CORS options
 const allowedOriginsList = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
-app.use(cors({
-  origin: function(origin, callback) {
+const corsOptions = {
+  origin: function (origin, callback) {
+    // allow requests with no origin (curl, server-to-server)
     if (!origin) return callback(null, true);
-    if (allowedOriginsList.length === 0) return callback(null, true);
+
+    // If ALLOWED_ORIGINS not configured -> demo friendly: allow but also allow vercel previews and BASE_URL
+    if (allowedOriginsList.length === 0) {
+      if (BASE_URL && origin === BASE_URL) return callback(null, true);
+      if (/\.vercel\.app$/.test(origin)) return callback(null, true);
+      return callback(null, true); // permissive fallback for demo/testing
+    }
+
+    // exact matches
     if (allowedOriginsList.indexOf(origin) !== -1) return callback(null, true);
+
+    // match BASE_URL if provided
+    if (BASE_URL && origin === BASE_URL) return callback(null, true);
+
+    // support wildcard entries like '*.example.com'
+    for (const cfg of allowedOriginsList) {
+      if (cfg.startsWith("*.") && origin.endsWith(cfg.slice(1))) return callback(null, true);
+    }
+
+    // not allowed
     return callback(new Error("CORS error: origin not allowed"));
   },
-  credentials: true
-}));
+  credentials: true,
+  optionsSuccessStatus: 204
+};
+app.use(cors(corsOptions));
 
-// uploads
+// ---------- uploads setup ----------
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
@@ -157,7 +197,6 @@ async function callOpenAIChat({ messages, model = OPENAI_MODEL, max_tokens = 800
 async function callElevenLabsTTS(text) {
   if (!ELEVENLABS_API_KEY) return null;
   try {
-    // ElevenLabs endpoint may vary; this is a generic POST flavor.
     const endpoint = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVENLABS_VOICE)}`;
     const r = await fetchFn(endpoint, {
       method: "POST",
@@ -185,6 +224,7 @@ async function callElevenLabsTTS(text) {
 
 // health
 app.get("/", (req, res) => res.json({ status: "ok", message: "Shop Assistant API running" }));
+app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // mascot upload
 app.post("/mascot/upload", upload.single("mascot"), async (req, res) => {
@@ -263,7 +303,7 @@ app.post("/api/message", async (req, res) => {
     }
     if (!replyText) replyText = `Demo reply: ${String(text).slice(0, 200)}`;
 
-    // TTS
+    // TTS via ElevenLabs if configured
     let ttsUrl = null;
     if (ELEVENLABS_API_KEY) {
       try {
@@ -325,9 +365,6 @@ app.post("/api/lead", async (req, res) => {
     return res.status(500).json({ error: "server error" });
   }
 });
-
-// final health
-app.get("/health", (req, res) => res.json({ status: "ok" }));
 
 // start
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
