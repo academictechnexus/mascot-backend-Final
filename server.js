@@ -1,29 +1,11 @@
 /**
- * server.js (patched: trust-proxy + robust CORS)
- *
- * - Trusts proxy headers (app.set('trust proxy', 1)) for correct rate-limiter behavior behind Railway/Vercel.
- * - Robust CORS handling; supports ALLOWED_ORIGINS, BASE_URL, and .vercel.app previews.
- * - Uses fetch-based OpenAI REST calls (no SDK) to avoid version mismatch problems.
- * - Optional ElevenLabs TTS support (returns data:audio/... base64 ttsUrl).
- * - Endpoints:
- *    POST /api/message  -> { text, ttsUrl }
- *    POST /api/lead     -> { id }
- *    POST /mascot/upload
- *    POST /api/chat     -> legacy compatibility
- *    GET  /, /health
- *
- * Env variables supported (tolerant mapping):
- *  OPENAI_API_KEY | OPENAI_KEY | OPENAI
- *  OPENAI_MODEL
- *  ELEVENLABS_API_KEY | ELEVENLABS_KEY | ELEVENLABS
- *  ELEVENLABS_VOICE | ELEVEN_VOICE
- *  SLACK_WEBHOOK_URL | SLACK_WEBHOOK
- *  BASE_URL
- *  ALLOWED_ORIGINS (comma-separated)
- *  MAX_UPLOAD_BYTES
- *  RATE_LIMIT_MAX
- *  RATE_LIMIT_WINDOW_MS
- *  PLACEHOLDER_GLB
+ * server.js (full replacement)
+ * - Trusts proxy headers for correct rate-limiter behavior behind Railway/Vercel.
+ * - Robust CORS handling with ALLOWED_ORIGINS, BASE_URL, and .vercel.app previews.
+ * - Preflight handled explicitly before rate limiter.
+ * - Clean CORS error responses to avoid 500 stack traces in logs.
+ * - OpenAI (REST) + optional ElevenLabs TTS support.
+ * - Uploads, leads, chat, message endpoints.
  */
 
 const express = require("express");
@@ -51,7 +33,6 @@ const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "12", 10);
 const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10);
 const PLACEHOLDER_GLB = process.env.PLACEHOLDER_GLB || "https://models.readyplayer.me/68b5e67fbac430a52ce1260e.glb";
 
-// Node fetch (global available in Node 18+)
 const fetchFn = global.fetch ? global.fetch.bind(global) : (async () => { throw new Error("global fetch not available"); });
 
 // ---------- app setup ----------
@@ -66,24 +47,26 @@ app.use(express.json({ limit: "2mb" }));
 app.use(express.urlencoded({ extended: true }));
 app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
 
-// rate limiter - attach after trust proxy
-app.use(rateLimit({
-  windowMs: RATE_LIMIT_WINDOW_MS,
-  max: RATE_LIMIT_MAX
-}));
+// ---------- debug middleware ----------
+app.use((req, res, next) => {
+  console.log('Incoming request origin:', req.headers.origin, 'method:', req.method, 'url:', req.url);
+  next();
+});
 
-// Robust CORS options
+// ---------- CORS setup ----------
 const allowedOriginsList = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+
 const corsOptions = {
   origin: function (origin, callback) {
+    console.log('[CORS] origin check ->', origin);
     // allow requests with no origin (curl, server-to-server)
     if (!origin) return callback(null, true);
 
-    // If ALLOWED_ORIGINS not configured -> demo friendly: allow but also allow vercel previews and BASE_URL
+    // permissive fallback for demo if no ALLOWED_ORIGINS configured
     if (allowedOriginsList.length === 0) {
       if (BASE_URL && origin === BASE_URL) return callback(null, true);
       if (/\.vercel\.app$/.test(origin)) return callback(null, true);
-      return callback(null, true); // permissive fallback for demo/testing
+      return callback(null, true);
     }
 
     // exact matches
@@ -92,7 +75,7 @@ const corsOptions = {
     // match BASE_URL if provided
     if (BASE_URL && origin === BASE_URL) return callback(null, true);
 
-    // support wildcard entries like '*.example.com'
+    // wildcard support like '*.example.com'
     for (const cfg of allowedOriginsList) {
       if (cfg.startsWith("*.") && origin.endsWith(cfg.slice(1))) return callback(null, true);
     }
@@ -101,9 +84,20 @@ const corsOptions = {
     return callback(new Error("CORS error: origin not allowed"));
   },
   credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
   optionsSuccessStatus: 204
 };
+
+// Ensure preflight is answered before any middleware that might reject (rate limiter etc)
+app.options('*', cors(corsOptions));
 app.use(cors(corsOptions));
+
+// ---------- rate limiter (after CORS) ----------
+app.use(rateLimit({
+  windowMs: RATE_LIMIT_WINDOW_MS,
+  max: RATE_LIMIT_MAX
+}));
 
 // ---------- uploads setup ----------
 const UPLOAD_DIR = path.join(__dirname, "uploads");
@@ -366,5 +360,18 @@ app.post("/api/lead", async (req, res) => {
   }
 });
 
-// start
+// ---------- CORS / generic error handler (clean responses) ----------
+app.use((err, req, res, next) => {
+  if (err && String(err.message).toLowerCase().includes('cors')) {
+    console.warn('[CORS] rejected origin:', req.headers.origin, 'msg:', err.message);
+    return res.status(403).json({ error: 'CORS error: origin not allowed', origin: req.headers.origin });
+  }
+  // multer file errors
+  if (err && err.code === 'LIMIT_FILE_SIZE') {
+    return res.status(413).json({ error: 'File too large' });
+  }
+  return next(err);
+});
+
+// ---------- start ----------
 app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
