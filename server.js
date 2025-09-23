@@ -1,11 +1,9 @@
 /**
  * server.js (full replacement)
- * - Trusts proxy headers for correct rate-limiter behavior behind Railway/Vercel.
- * - Robust CORS handling with ALLOWED_ORIGINS, BASE_URL, and .vercel.app previews.
- * - Preflight handled explicitly before rate limiter.
- * - Clean CORS error responses to avoid 500 stack traces in logs.
- * - OpenAI (REST) + optional ElevenLabs TTS support.
- * - Uploads, leads, chat, message endpoints.
+ * - Robust CORS normalization and wildcard handling
+ * - Preflight handled before rate limiter
+ * - Clean CORS error responses
+ * - Uploads, OpenAI REST helper, ElevenLabs optional TTS, endpoints preserved
  */
 
 const express = require("express");
@@ -53,39 +51,60 @@ app.use((req, res, next) => {
   next();
 });
 
-// ---------- CORS setup ----------
-const allowedOriginsList = ALLOWED_ORIGINS.split(",").map(s => s.trim()).filter(Boolean);
+// ---------- CORS normalization helpers ----------
+function normalizeOrigin(o) {
+  if (!o) return "";
+  // remove whitespace, trailing slash, lowercase for consistent compare
+  return o.trim().replace(/\/+$/, "").toLowerCase();
+}
+
+const allowedOriginsListRaw = (ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
+const allowedOriginsNormalized = allowedOriginsListRaw.map(normalizeOrigin);
+console.log('[CORS] configured raw ALLOWED_ORIGINS ->', allowedOriginsListRaw);
+console.log('[CORS] configured normalized ALLOWED_ORIGINS ->', allowedOriginsNormalized, 'BASE_URL(normalized)=', normalizeOrigin(BASE_URL));
 
 const corsOptions = {
   origin: function (origin, callback) {
-    console.log('[CORS] origin check ->', origin);
-    // allow requests with no origin (curl, server-to-server)
+    console.log('[CORS] incoming origin ->', origin);
+    // allow server-to-server requests (no Origin header)
     if (!origin) return callback(null, true);
 
-    // permissive fallback for demo if no ALLOWED_ORIGINS configured
-    if (allowedOriginsList.length === 0) {
-      if (BASE_URL && origin === BASE_URL) return callback(null, true);
-      if (/\.vercel\.app$/.test(origin)) return callback(null, true);
+    const incoming = normalizeOrigin(origin);
+
+    // allow everything if '*' configured
+    if (allowedOriginsNormalized.includes('*')) return callback(null, true);
+
+    // if none configured -> demo-friendly fallback: allow BASE_URL and vercel previews
+    if (allowedOriginsNormalized.length === 0) {
+      if (normalizeOrigin(BASE_URL) && incoming === normalizeOrigin(BASE_URL)) return callback(null, true);
+      if (/\.vercel\.app$/.test(incoming)) return callback(null, true);
+      // permissive fallback for demo (change this in prod)
       return callback(null, true);
     }
 
-    // exact matches
-    if (allowedOriginsList.indexOf(origin) !== -1) return callback(null, true);
+    // direct exact match (protocol + host)
+    if (allowedOriginsNormalized.includes(incoming)) return callback(null, true);
 
-    // match BASE_URL if provided
-    if (BASE_URL && origin === BASE_URL) return callback(null, true);
+    // allow if BASE_URL normalized matches
+    if (normalizeOrigin(BASE_URL) && incoming === normalizeOrigin(BASE_URL)) return callback(null, true);
 
-    // wildcard support like '*.example.com'
-    for (const cfg of allowedOriginsList) {
-      if (cfg.startsWith("*.") && origin.endsWith(cfg.slice(1))) return callback(null, true);
+    // wildcard support entries: '*.example.com', '.example.com', 'vercel.app' (suffix match)
+    for (const cfg of allowedOriginsNormalized) {
+      if (!cfg) continue;
+      if (cfg === 'vercel.app' && /\.vercel\.app$/.test(incoming)) return callback(null, true);
+      if (cfg === '*.vercel.app' && /\.vercel\.app$/.test(incoming)) return callback(null, true);
+      if (cfg.startsWith('*.') && incoming.endsWith(cfg.slice(1))) return callback(null, true);
+      if (cfg.startsWith('.') && incoming.endsWith(cfg)) return callback(null, true);
+      // simple suffix match for domain-like entries without protocol, e.g., 'example.com'
+      if (!cfg.startsWith('http') && incoming.endsWith(cfg)) return callback(null, true);
     }
 
-    // not allowed
-    return callback(new Error("CORS error: origin not allowed"));
+    console.warn('[CORS] rejecting origin:', origin, 'normalized incoming:', incoming, 'allowed:', allowedOriginsNormalized);
+    return callback(new Error('CORS error: origin not allowed'));
   },
   credentials: true,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
+  allowedHeaders: ['Content-Type','Authorization','X-Requested-With'],
   optionsSuccessStatus: 204
 };
 
