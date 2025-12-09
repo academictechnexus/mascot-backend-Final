@@ -254,16 +254,6 @@ ${transcript}
 }
 
 // ---------- Middlewares ----------
-
-// Global CORS – this is what fixes your browser error
-const corsOptions = {
-  origin: "*", // allow all for now; you can restrict later
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-};
-app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // handle preflight for all routes
-
 app.use(
   helmet({
     contentSecurityPolicy: false,
@@ -271,6 +261,26 @@ app.use(
   })
 );
 app.use(express.json({ limit: "1mb" }));
+
+// TEMP: allow all origins (works everywhere). Tighten later with an allowlist.
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// ✅ EXTRA: force CORS headers + handle OPTIONS preflight for all routes
+app.use((req, res, next) => {
+  res.header("Access-Control-Allow-Origin", "*");
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
+  if (req.method === "OPTIONS") {
+    return res.sendStatus(204); // preflight OK, no body
+  }
+  next();
+});
 
 // Logging (no bodies)
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
