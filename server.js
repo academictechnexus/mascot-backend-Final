@@ -262,14 +262,16 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
-// TEMP: allow all origins (works everywhere). Tighten later with an allowlist.
-app.use(
-  cors({
-    origin: "*",
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-);
+// CORS for all routes
+const corsOptions = {
+  origin: "*",
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+};
+app.use(cors(corsOptions));
+
+// **IMPORTANT**: handle preflight OPTIONS so browser doesn't fail with "Network error"
+app.options("*", cors(corsOptions));
 
 // Logging (no bodies)
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
