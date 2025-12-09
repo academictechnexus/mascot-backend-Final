@@ -271,17 +271,6 @@ app.use(
   })
 );
 
-// ✅ EXTRA: force CORS headers + handle OPTIONS preflight for all routes
-app.use((req, res, next) => {
-  res.header("Access-Control-Allow-Origin", "*");
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-  res.header("Access-Control-Allow-Headers", "Content-Type, Authorization");
-  if (req.method === "OPTIONS") {
-    return res.sendStatus(204); // preflight OK, no body
-  }
-  next();
-});
-
 // Logging (no bodies)
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
 app.use(
