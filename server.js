@@ -1,396 +1,269 @@
-/**
- * server.js (full replacement)
- * - Robust CORS normalization and wildcard handling
- * - Preflight handled before rate limiter
- * - Clean CORS error responses
- * - Uploads, OpenAI REST helper, ElevenLabs optional TTS, endpoints preserved
- */
+// server.js
+// Fresh backend with RAG-style context + per-site daily limit.
 
 const express = require("express");
 const cors = require("cors");
-const morgan = require("morgan");
 const helmet = require("helmet");
 const rateLimit = require("express-rate-limit");
-const dotenv = require("dotenv");
+const axios = require("axios");
+const morgan = require("morgan");
 const multer = require("multer");
-const path = require("path");
 const fs = require("fs");
+const path = require("path");
+require("dotenv").config();
 
-dotenv.config();
-
-// ---------- tolerant env resolution ----------
-const OPENAI_API_KEY = process.env.OPENAI_API_KEY || process.env.OPENAI_KEY || process.env.OPENAI;
-const OPENAI_MODEL = process.env.OPENAI_MODEL || process.env.OPENAI_MODEL_NAME || "gpt-4o-mini";
-const ELEVENLABS_API_KEY = process.env.ELEVENLABS_API_KEY || process.env.ELEVENLABS_KEY || process.env.ELEVENLABS;
-const ELEVENLABS_VOICE = process.env.ELEVENLABS_VOICE || process.env.ELEVEN_VOICE || "alloy";
-const SLACK_WEBHOOK = process.env.SLACK_WEBHOOK_URL || process.env.SLACK_WEBHOOK || process.env.SLACK_WEBHOOK_URL;
-const BASE_URL = process.env.BASE_URL || "";
-const ALLOWED_ORIGINS = process.env.ALLOWED_ORIGINS || "";
-const MAX_UPLOAD_BYTES = parseInt(process.env.MAX_UPLOAD_BYTES || process.env.UPLOAD_MAX || String(2 * 1024 * 1024), 10);
-const RATE_LIMIT_MAX = parseInt(process.env.RATE_LIMIT_MAX || "12", 10);
-const RATE_LIMIT_WINDOW_MS = parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10);
-const PLACEHOLDER_GLB = process.env.PLACEHOLDER_GLB || "https://models.readyplayer.me/68b5e67fbac430a52ce1260e.glb";
-
-const fetchFn = global.fetch ? global.fetch.bind(global) : (async () => { throw new Error("global fetch not available"); });
-
-// ---------- app setup ----------
 const app = express();
-const PORT = process.env.PORT || 3000;
 
-// Trust proxy so Express reads X-Forwarded-* headers (required behind Railway/Vercel proxies)
-app.set('trust proxy', 1);
+// ---------- Config ----------
+const PORT = process.env.PORT || 8080;
+const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 
-app.use(helmet());
-app.use(express.json({ limit: "2mb" }));
-app.use(express.urlencoded({ extended: true }));
-app.use(morgan(process.env.NODE_ENV === "production" ? "combined" : "dev"));
+// daily quota per site/domain (admin can change in env)
+const QUOTA_PER_DAY = parseInt(process.env.QUOTA_PER_DAY || "15", 10);
+const QUOTA_FILE = path.join(__dirname, "quotas.json");
 
-// ---------- debug middleware ----------
-app.use((req, res, next) => {
-  console.log('Incoming request origin:', req.headers.origin, 'method:', req.method, 'url:', req.url);
-  next();
-});
-
-// ---------- CORS normalization helpers ----------
-function normalizeOrigin(o) {
-  if (!o) return "";
-  // remove whitespace, trailing slash, lowercase for consistent compare
-  return o.trim().replace(/\/+$/, "").toLowerCase();
-}
-
-const allowedOriginsListRaw = (ALLOWED_ORIGINS || "").split(",").map(s => s.trim()).filter(Boolean);
-const allowedOriginsNormalized = allowedOriginsListRaw.map(normalizeOrigin);
-console.log('[CORS] configured raw ALLOWED_ORIGINS ->', allowedOriginsListRaw);
-console.log('[CORS] configured normalized ALLOWED_ORIGINS ->', allowedOriginsNormalized, 'BASE_URL(normalized)=', normalizeOrigin(BASE_URL));
-
-const corsOptions = {
-  origin: function (origin, callback) {
-    console.log('[CORS] incoming origin ->', origin);
-    // allow server-to-server requests (no Origin header)
-    if (!origin) return callback(null, true);
-
-    const incoming = normalizeOrigin(origin);
-
-    // allow everything if '*' configured
-    if (allowedOriginsNormalized.includes('*')) return callback(null, true);
-
-    // if none configured -> demo-friendly fallback: allow BASE_URL and vercel previews
-    if (allowedOriginsNormalized.length === 0) {
-      if (normalizeOrigin(BASE_URL) && incoming === normalizeOrigin(BASE_URL)) return callback(null, true);
-      if (/\.vercel\.app$/.test(incoming)) return callback(null, true);
-      // permissive fallback for demo (change this in prod)
-      return callback(null, true);
-    }
-
-    // direct exact match (protocol + host)
-    if (allowedOriginsNormalized.includes(incoming)) return callback(null, true);
-
-    // allow if BASE_URL normalized matches
-    if (normalizeOrigin(BASE_URL) && incoming === normalizeOrigin(BASE_URL)) return callback(null, true);
-
-    // wildcard support entries: '*.example.com', '.example.com', 'vercel.app' (suffix match)
-    for (const cfg of allowedOriginsNormalized) {
-      if (!cfg) continue;
-      if (cfg === 'vercel.app' && /\.vercel\.app$/.test(incoming)) return callback(null, true);
-      if (cfg === '*.vercel.app' && /\.vercel\.app$/.test(incoming)) return callback(null, true);
-      if (cfg.startsWith('*.') && incoming.endsWith(cfg.slice(1))) return callback(null, true);
-      if (cfg.startsWith('.') && incoming.endsWith(cfg)) return callback(null, true);
-      // simple suffix match for domain-like entries without protocol, e.g., 'example.com'
-      if (!cfg.startsWith('http') && incoming.endsWith(cfg)) return callback(null, true);
-    }
-
-    console.warn('[CORS] rejecting origin:', origin, 'normalized incoming:', incoming, 'allowed:', allowedOriginsNormalized);
-    return callback(new Error('CORS error: origin not allowed'));
-  },
-  credentials: true,
-  methods: ['GET','POST','PUT','DELETE','OPTIONS'],
-  allowedHeaders: ['Content-Type','Authorization','X-Requested-With'],
-  optionsSuccessStatus: 204
-};
-
-// Ensure preflight is answered before any middleware that might reject (rate limiter etc)
-app.options('*', cors(corsOptions));
-app.use(cors(corsOptions));
-
-// ---------- rate limiter (after CORS) ----------
-app.use(rateLimit({
-  windowMs: RATE_LIMIT_WINDOW_MS,
-  max: RATE_LIMIT_MAX
-}));
-
-// ---------- uploads setup ----------
-const UPLOAD_DIR = path.join(__dirname, "uploads");
-if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR, { recursive: true });
-
-const storage = multer.diskStorage({
-  destination: (req, file, cb) => cb(null, UPLOAD_DIR),
-  filename: (req, file, cb) => {
-    const safe = Date.now() + "-" + file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_");
-    cb(null, safe);
-  }
-});
-const upload = multer({
-  storage,
-  limits: { fileSize: MAX_UPLOAD_BYTES },
-  fileFilter: (req, file, cb) => {
-    if (!file.mimetype.startsWith("image/")) return cb(new Error("Only image files are allowed"));
-    cb(null, true);
-  }
-});
-app.use("/uploads", express.static(UPLOAD_DIR, { index: false }));
-
-// ---------- helpers ----------
-function getBaseUrl(req) {
-  if (BASE_URL) return BASE_URL.replace(/\/$/, "");
-  const proto = req.headers["x-forwarded-proto"] || req.protocol;
-  const host = req.headers["x-forwarded-host"] || req.get("host");
-  return `${proto}://${host}`;
-}
-
-function rndId(prefix = "id") {
-  return prefix + "_" + Math.random().toString(36).slice(2, 9);
-}
-
-// leads persistence
-const LEADS_FILE = path.join(__dirname, "leads.json");
-function saveLeadToFile(lead) {
+// ---------- Quota helpers ----------
+function readQuotaStore() {
   try {
-    if (!fs.existsSync(LEADS_FILE)) fs.writeFileSync(LEADS_FILE, "[]", "utf8");
-    const raw = fs.readFileSync(LEADS_FILE, "utf8") || "[]";
-    const arr = JSON.parse(raw);
-    arr.push(lead);
-    fs.writeFileSync(LEADS_FILE, JSON.stringify(arr, null, 2), "utf8");
+    if (!fs.existsSync(QUOTA_FILE)) return {};
+    const raw = fs.readFileSync(QUOTA_FILE, "utf8") || "{}";
+    return JSON.parse(raw);
   } catch (e) {
-    console.warn("saveLeadToFile failed:", e);
+    console.warn("readQuotaStore failed:", e);
+    return {};
   }
 }
 
-// chat log append
-function appendChatLog(entry) {
+function writeQuotaStore(data) {
   try {
-    const dir = path.join(__dirname, "chatlogs");
-    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
-    const file = path.join(dir, `${new Date().toISOString().slice(0,10)}.jsonl`);
-    fs.appendFileSync(file, JSON.stringify(entry) + "\n", "utf8");
+    fs.writeFileSync(QUOTA_FILE, JSON.stringify(data, null, 2), "utf8");
   } catch (e) {
-    console.warn("appendChatLog failed:", e);
+    console.warn("writeQuotaStore failed:", e);
   }
 }
 
-// ---------- OpenAI REST helper ----------
-async function callOpenAIChat({ messages, model = OPENAI_MODEL, max_tokens = 800, timeoutMs = 60000 }) {
-  if (!OPENAI_API_KEY) throw new Error("OPENAI_API_KEY not configured");
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
+/**
+ * Check & increment daily quota per siteKey (e.g. domain/origin).
+ * Returns { allowed: boolean, remaining: number }
+ */
+function checkAndIncrementQuota(siteKey) {
+  const today = new Date().toISOString().slice(0, 10); // YYYY-MM-DD
+  const store = readQuotaStore();
+
+  if (!store[today]) store[today] = {};
+  const used = store[today][siteKey] || 0;
+
+  if (used >= QUOTA_PER_DAY) {
+    return { allowed: false, remaining: 0 };
+  }
+
+  store[today][siteKey] = used + 1;
+  writeQuotaStore(store);
+
+  return { allowed: true, remaining: QUOTA_PER_DAY - (used + 1) };
+}
+
+// ---------- Middlewares ----------
+app.use(
+  helmet({
+    contentSecurityPolicy: false,
+    crossOriginResourcePolicy: { policy: "cross-origin" },
+  })
+);
+app.use(express.json({ limit: "1mb" }));
+
+// TEMP: allow all origins (works everywhere). Tighten later with an allowlist.
+app.use(
+  cors({
+    origin: "*",
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// Logging (no bodies)
+morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
+app.use(
+  morgan(":reqid :method :url :status - :response-time ms", {
+    skip: (r) => r.path === "/health",
+  })
+);
+
+// Rate limit just the AI & upload endpoints
+const limiter = rateLimit({
+  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10),
+  max: parseInt(process.env.RATE_LIMIT_MAX || "8", 10),
+  standardHeaders: true,
+  legacyHeaders: false,
+});
+app.use("/chat", limiter);
+app.use("/mascot/upload", limiter);
+
+// ---------- Health ----------
+app.get("/", (_req, res) => res.status(200).send("OK"));
+app.get("/health", (_req, res) =>
+  res.json({
+    ok: true,
+    service: "mascot-backend",
+    time: new Date().toISOString(),
+  })
+);
+
+// ---------- Diagnostics ----------
+app.get("/openai/ping", async (_req, res) => {
   try {
-    const resp = await fetchFn("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${OPENAI_API_KEY}`
-      },
-      body: JSON.stringify({ model, messages, max_tokens }),
-      signal: controller.signal
+    if (!OPENAI_API_KEY)
+      return res
+        .status(500)
+        .json({ ok: false, detail: "OPENAI_API_KEY not set" });
+    const r = await axios.get("https://api.openai.com/v1/models", {
+      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
+      timeout: 10000,
     });
-    clearTimeout(id);
-    if (!resp.ok) {
-      const txt = await resp.text();
-      const err = new Error(`OpenAI API error ${resp.status}: ${txt}`);
-      err.status = resp.status;
-      throw err;
-    }
-    return await resp.json();
-  } catch (err) {
-    clearTimeout(id);
-    throw err;
-  }
-}
-
-// ---------- ElevenLabs TTS helper (optional) ----------
-async function callElevenLabsTTS(text) {
-  if (!ELEVENLABS_API_KEY) return null;
-  try {
-    const endpoint = `https://api.elevenlabs.io/v1/text-to-speech/${encodeURIComponent(ELEVENLABS_VOICE)}`;
-    const r = await fetchFn(endpoint, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "xi-api-key": ELEVENLABS_API_KEY
-      },
-      body: JSON.stringify({ text })
-    });
-    if (!r.ok) {
-      const body = await r.text();
-      console.warn("ElevenLabs TTS error:", r.status, body);
-      return null;
-    }
-    const buffer = await r.arrayBuffer();
-    const base64 = Buffer.from(buffer).toString("base64");
-    return `data:audio/mpeg;base64,${base64}`;
+    res.json({ ok: true, count: r.data?.data?.length || 0 });
   } catch (e) {
-    console.warn("callElevenLabsTTS failed:", e);
-    return null;
-  }
-}
-
-// ---------- Routes ----------
-
-// health
-app.get("/", (req, res) => res.json({ status: "ok", message: "Shop Assistant API running" }));
-app.get("/health", (req, res) => res.json({ status: "ok" }));
-
-// mascot upload
-app.post("/mascot/upload", upload.single("mascot"), async (req, res) => {
-  try {
-    if (!req.file) return res.status(400).json({ error: "No file uploaded" });
-    const base = getBaseUrl(req);
-    const uploaded_image_url = `${base}/uploads/${req.file.filename}`;
-    const glb_url = PLACEHOLDER_GLB;
-    return res.json({ uploaded_image_url, glb_url, note: "placeholder GLB returned (demo)" });
-  } catch (err) {
-    console.error("upload error:", err);
-    return res.status(500).json({ error: "upload failed" });
+    const status = e?.response?.status || 500;
+    const detail = e?.response?.data || e.message;
+    res.status(status).json({ ok: false, detail });
   }
 });
 
-// legacy /api/chat (kept)
-app.post("/api/chat", async (req, res) => {
+// Helpful message if someone GETs /chat in a browser
+app.get("/chat", (_req, res) =>
+  res.status(405).json({ error: "Use POST /chat", example: { message: "Hello" } })
+);
+
+// ---------- Chat (OpenAI + RAG + quota) ----------
+const SYSTEM_PROMPT =
+  "You are Academic Technexus's helpful assistant. Be concise, friendly, and safe.";
+
+app.post("/chat", async (req, res) => {
   try {
-    const { message } = req.body || {};
-    if (!message || String(message).trim().length === 0) return res.status(400).json({ error: "No message provided" });
+    // support both old shape {message} and new {text, context, site, pageUrl}
+    const userMessage = (
+      req.body?.message ||
+      req.body?.text ||
+      ""
+    )
+      .toString()
+      .trim();
 
-    const txt = String(message).toLowerCase();
-    let action = "talk";
-    if (txt.includes("dance")) action = "dance";
-    else if (txt.includes("walk")) action = "walk";
-    else if (txt.includes("wave")) action = "wave";
+    if (!userMessage)
+      return res.status(400).json({ error: "Missing 'message' or 'text' in body." });
 
-    if (OPENAI_API_KEY) {
-      try {
-        const messages = [
-          { role: "system", content: "You are a friendly shop assistant for an ecommerce store. Answer helpfully and concisely." },
-          { role: "user", content: message }
-        ];
-        const completion = await callOpenAIChat({ messages, model: OPENAI_MODEL, max_tokens: 400 });
-        const replyText = completion?.choices?.[0]?.message?.content || completion?.choices?.[0]?.text || "Sorry — could not generate reply.";
-        return res.json({ reply: replyText, action });
-      } catch (err) {
-        console.error("OpenAI error (api/chat):", err);
-      }
+    if (!OPENAI_API_KEY) {
+      return res.status(500).json({
+        reply: "⚠️ Server not configured with OPENAI_API_KEY.",
+      });
     }
 
-    // fallback
-    let reply = "Demo assistant: " + String(message);
-    if (action === "dance") reply = "Let's dance! 💃";
-    else if (action === "walk") reply = "Taking a short walk... 🚶";
-    else if (action === "wave") reply = "Waving hello! 👋";
-    else reply = "Thanks! I heard you — this is a demo reply.";
+    const pageUrl = (req.body?.pageUrl || "").toString();
+    const site = (req.body?.site || "").toString();
+    const contextRaw = (req.body?.context || "").toString();
 
-    return res.json({ reply, action });
-  } catch (err) {
-    console.error("/api/chat error:", err);
-    return res.status(500).json({ error: "server error" });
-  }
-});
+    const originHeader = req.headers.origin || "";
+    const siteKey = site || originHeader || "unknown-site";
 
-// NEW: /api/message for widget
-app.post("/api/message", async (req, res) => {
-  try {
-    const { sessionId, text } = req.body || {};
-    if (!text || String(text).trim().length === 0) return res.status(400).json({ error: "No text provided" });
+    // --- Per-site daily quota ---
+    const { allowed, remaining } = checkAndIncrementQuota(siteKey);
+    if (!allowed) {
+      return res.status(429).json({
+        error: "daily_limit_reached",
+        message: "Daily chat limit has been reached for this site.",
+        remaining: 0,
+        reply:
+          "Daily chat limit has been reached for this site. Please try again tomorrow.",
+      });
+    }
+
+    // --- RAG-style context (lightweight) ---
+    const contextText =
+      contextRaw.trim().slice(0, 3000) ||
+      "No specific page context was provided.";
+
+    const systemContext = [
+      "You are an AI assistant embedded on a website or app.",
+      "Use the provided CONTEXT from the current page when it is relevant to the user's question.",
+      "If the context is not helpful or is unrelated, fall back to your general knowledge.",
+      "Always answer clearly and concisely.",
+    ].join(" ");
+
+    const contextPrompt = [
+      "CONTEXT FROM WEBSITE / APP:",
+      `Site: ${site || originHeader || "unknown"}`,
+      `Page URL: ${pageUrl || "unknown"}`,
+      "---",
+      contextText,
+    ].join("\n");
 
     const messages = [
-      { role: "system", content: "You are a helpful Shopify app developer assistant. Keep replies short and actionable." },
-      { role: "user", content: String(text) }
+      { role: "system", content: SYSTEM_PROMPT },
+      { role: "system", content: systemContext },
+      { role: "system", content: contextPrompt },
+      { role: "user", content: userMessage },
     ];
 
-    let replyText = null;
-    if (OPENAI_API_KEY) {
-      try {
-        const completion = await callOpenAIChat({ messages, model: OPENAI_MODEL, max_tokens: 500 });
-        replyText = completion?.choices?.[0]?.message?.content || completion?.choices?.[0]?.text || null;
-      } catch (err) {
-        console.error("OpenAI call failed (api/message):", err);
-        replyText = null;
+    const ai = await axios.post(
+      "https://api.openai.com/v1/chat/completions",
+      {
+        model: "gpt-4o-mini",
+        messages,
+        temperature: 0.6,
+        max_tokens: 500,
+      },
+      {
+        timeout: 20000,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
       }
-    }
-    if (!replyText) replyText = `Demo reply: ${String(text).slice(0, 200)}`;
+    );
 
-    // TTS via ElevenLabs if configured
-    let ttsUrl = null;
-    if (ELEVENLABS_API_KEY) {
-      try {
-        ttsUrl = await callElevenLabsTTS(replyText);
-      } catch (e) {
-        console.warn("TTS failed:", e);
-        ttsUrl = null;
-      }
-    }
+    const reply =
+      ai?.data?.choices?.[0]?.message?.content?.trim() ||
+      "Sorry, I couldn’t generate a response.";
 
-    // save chat log (non-blocking)
-    try {
-      appendChatLog({ id: rndId("chat"), sessionId: sessionId || null, text, reply: replyText, created_at: new Date().toISOString() });
-    } catch (e) {
-      console.warn("could not save chat log:", e);
-    }
-
-    return res.json({ text: replyText, ttsUrl });
+    res.json({ reply, remaining });
   } catch (err) {
-    console.error("/api/message error:", err);
-    return res.status(500).json({ error: "server error" });
+    const status = err?.response?.status || 502;
+    const code = err?.response?.data?.error?.code;
+    const friendly =
+      code === "insufficient_quota"
+        ? "⚠️ Demo usage limit reached. Please try again later."
+        : "⚠️ I’m having trouble reaching the AI service. Please try again.";
+    console.error("OpenAI /chat error:", err?.response?.data || err.message);
+    res.status(status).json({ reply: friendly });
   }
 });
 
-// NEW: /api/lead
-app.post("/api/lead", async (req, res) => {
+// ---------- Mascot Upload (local storage) ----------
+const upload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 5 * 1024 * 1024 },
+}); // 5MB
+const UPLOAD_DIR = path.join(__dirname, "uploads");
+if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
+app.use("/uploads", express.static(UPLOAD_DIR));
+
+app.post("/mascot/upload", upload.single("mascot"), (req, res) => {
   try {
-    const { name, email, need, storeUrl, message } = req.body || {};
-    if (!name || !email) return res.status(400).json({ error: "name and email required" });
-
-    const lead = {
-      id: rndId("lead"),
-      name: String(name),
-      email: String(email),
-      need: String(need || ""),
-      storeUrl: String(storeUrl || ""),
-      message: String(message || ""),
-      created_at: new Date().toISOString()
-    };
-
-    try { saveLeadToFile(lead); } catch (e) { console.warn("persist lead failed:", e); }
-
-    // notify slack if available
-    if (SLACK_WEBHOOK) {
-      try {
-        await fetchFn(SLACK_WEBHOOK, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ text: `New lead: ${lead.name} <${lead.email}> - ${lead.need || 'no-need'} - ${lead.storeUrl || 'no-store'}` })
-        });
-      } catch (e) {
-        console.warn("slack notify failed:", e);
-      }
-    }
-
-    return res.json({ id: lead.id });
-  } catch (err) {
-    console.error("/api/lead error:", err);
-    return res.status(500).json({ error: "server error" });
+    if (!req.file)
+      return res
+        .status(400)
+        .json({ success: false, error: "No file uploaded. Field name 'mascot'." });
+    const safeName = `${Date.now()}_${(
+      req.file.originalname || "mascot"
+    ).replace(/[^\w.-]/g, "_")}`;
+    fs.writeFileSync(path.join(UPLOAD_DIR, safeName), req.file.buffer);
+    return res.json({ success: true, url: `/uploads/${safeName}` });
+  } catch (e) {
+    console.error("Upload error:", e.message);
+    return res.status(500).json({ success: false, error: "Upload failed." });
   }
 });
 
-// ---------- CORS / generic error handler (clean responses) ----------
-app.use((err, req, res, next) => {
-  if (err && String(err.message).toLowerCase().includes('cors')) {
-    console.warn('[CORS] rejected origin:', req.headers.origin, 'msg:', err.message);
-    return res.status(403).json({ error: 'CORS error: origin not allowed', origin: req.headers.origin });
-  }
-  // multer file errors
-  if (err && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(413).json({ error: 'File too large' });
-  }
-  return next(err);
-});
-
-// ---------- start ----------
-app.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
+// ---------- Start ----------
+app.listen(PORT, () =>
+  console.log(`✅ Secure server running on port ${PORT}, quota per day: ${QUOTA_PER_DAY}`)
+);
