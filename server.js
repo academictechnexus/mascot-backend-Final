@@ -1,5 +1,6 @@
 // server.js
-// Full-featured mascot chatbot backend
+// Full-featured mascot chatbot backend (updated: trust-proxy + robust IPv4 DB resolution)
+//
 // - Multi-tenant (sites table)
 // - Plans: basic / pro / advanced (RAG, summaries)
 // - Usage quotas (daily)
@@ -21,10 +22,16 @@ const morgan = require("morgan");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
+const dns = require("dns").promises;
+const { URL } = require("url");
 require("dotenv").config();
 
 // ---------- Config ----------
 const app = express();
+
+// Allow express to trust proxy headers (fixes express-rate-limit X-Forwarded-For validation)
+app.set("trust proxy", true);
+
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
@@ -34,10 +41,7 @@ if (!DATABASE_URL) {
   // (we do not exit here; later flows might fail if DB is required)
 }
 
-// ---------- DB (with IPv4 resolution to avoid ENETUNREACH on IPv6-only hosts) ----------
-const dns = require("dns").promises;
-const { URL } = require("url");
-
+// ---------- DB (robust IPv4 resolution to avoid ENETUNREACH on IPv6-only hosts) ----------
 let pool = null;
 
 // lightweight db wrapper used by routes; will delegate to `pool` once ready.
@@ -60,19 +64,33 @@ const db = {
     const originalHost = parsed.hostname;
     let ipv4Host = null;
 
+    // 1) Try resolve4 (query A records)
     try {
       const addrs = await dns.resolve4(originalHost);
       if (Array.isArray(addrs) && addrs.length > 0) {
         ipv4Host = addrs[0];
-        console.log("✅ Resolved DB IPv4:", originalHost, "->", ipv4Host);
+        console.log("✅ Resolved DB IPv4 via resolve4:", originalHost, "->", ipv4Host);
       } else {
-        console.warn("⚠️ No IPv4 A records found for", originalHost);
+        console.warn("⚠️ No A records found for", originalHost, "via resolve4.");
       }
     } catch (dnsErr) {
-      console.warn("⚠️ dns.resolve4 failed (will try hostname):", dnsErr && dnsErr.message ? dnsErr.message : dnsErr);
+      console.warn("⚠️ dns.resolve4 failed (trying dns.lookup):", dnsErr && dnsErr.message ? dnsErr.message : dnsErr);
     }
 
-    // Build pool config preferring ipv4Host if available
+    // 2) Fallback: dns.lookup with family:4 (uses system resolver)
+    if (!ipv4Host) {
+      try {
+        const lk = await dns.lookup(originalHost, { family: 4 });
+        if (lk && lk.address) {
+          ipv4Host = lk.address;
+          console.log("✅ Resolved DB IPv4 via lookup:", originalHost, "->", ipv4Host);
+        }
+      } catch (lkErr) {
+        console.warn("⚠️ dns.lookup family:4 failed:", lkErr && lkErr.message ? lkErr.message : lkErr);
+      }
+    }
+
+    // 3) Build pool config preferring ipv4Host if available.
     const poolOptions = {
       user: parsed.username || undefined,
       password: parsed.password || undefined,
@@ -82,7 +100,6 @@ const db = {
       ssl: parsed.searchParams.get("sslmode") === "require" ? { rejectUnauthorized: false } : undefined,
     };
 
-    // Create the pool
     const { Pool } = require("pg");
     pool = new Pool(poolOptions);
 
@@ -91,7 +108,7 @@ const db = {
     console.log("✅ Postgres pool created and reachable (host used):", poolOptions.host);
   } catch (err) {
     console.error("❌ Failed to create Postgres pool:", err && err.message ? err.message : err);
-    // If you'd rather fail fast, uncomment next line:
+    // If you'd rather crash the process so deployment fails, uncomment:
     // process.exit(1);
   }
 })();
