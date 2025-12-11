@@ -1,16 +1,9 @@
 // server.js
-// Full-featured mascot chatbot backend (updated: trust-proxy + robust IPv4 DB resolution via resolve4 -> lookup -> DoH)
-// - Multi-tenant (sites table)
-// - Plans: basic / pro / advanced (RAG, summaries)
-// - Usage quotas (daily)
-// - Conversation & messages storage
-// - RAG context (knowledge_items)
-// - OpenAI Chat integration (axios)
-// - Upload endpoint (multer)
-// - Diagnostics: /health, /health-db, /openai/ping
-// - CORS, helmet, rate-limit, morgan
-// - Demo auto-create for demo-basic / demo-pro / demo-advanced
-// Keep this file updated and ensure env vars are set: DATABASE_URL, OPENAI_API_KEY
+// Full-featured mascot chatbot backend
+// - preserves all original routes & features (multi-tenant, plans, RAG, summarization, uploads, diagnostics)
+// - robust DB init: PGHOST_IPV4 env override -> resolve4 -> lookup(family:4) -> DoH -> hostname
+// - trust proxy enabled (fixes X-Forwarded-For / express-rate-limit)
+// Keep env vars: DATABASE_URL, OPENAI_API_KEY. Optionally set PGHOST_IPV4 to force IPv4.
 
 const express = require("express");
 const cors = require("cors");
@@ -27,22 +20,21 @@ require("dotenv").config();
 
 // ---------- Config ----------
 const app = express();
-
-// Trust proxy headers (fixes express-rate-limit X-Forwarded-For validation behind proxies/CDNs)
+// trust proxy so express-rate-limit sees X-Forwarded-For correctly behind Railway / Cloudflare
 app.set("trust proxy", true);
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
+// Optional override: set this in Railway env to force IPv4 host
+const PGHOST_IPV4 = process.env.PGHOST_IPV4 || "";
 
 if (!DATABASE_URL) {
   console.warn("⚠️ DATABASE_URL not set — server will proceed but DB calls will fail.");
 }
 
-// ---------- DB init (robust IPv4 resolution: resolve4 -> lookup family:4 -> DoH dns.google) ----------
+// ---------- DB init (robust IPv4 resolution with PGHOST_IPV4 override) ----------
 let pool = null;
-
-// lightweight db wrapper used by routes; will delegate to `pool` once ready.
 const db = {
   query: (text, params) => {
     if (!pool) throw new Error("Postgres pool not initialized yet");
@@ -61,17 +53,25 @@ const db = {
     const originalHost = parsed.hostname;
     let ipv4Host = null;
 
+    // 0) Highest priority: use PGHOST_IPV4 if provided (set in Railway env)
+    if (PGHOST_IPV4 && PGHOST_IPV4.match(/^\d{1,3}(\.\d{1,3}){3}$/)) {
+      ipv4Host = PGHOST_IPV4;
+      console.log("✅ Using PGHOST_IPV4 override:", ipv4Host);
+    }
+
     // 1) Try dns.resolve4 (direct A-record query)
-    try {
-      const addrs = await dns.resolve4(originalHost);
-      if (Array.isArray(addrs) && addrs.length > 0) {
-        ipv4Host = addrs[0];
-        console.log("✅ Resolved DB IPv4 via resolve4:", originalHost, "->", ipv4Host);
-      } else {
-        console.warn("⚠️ No A records via resolve4 for", originalHost);
+    if (!ipv4Host) {
+      try {
+        const addrs = await dns.resolve4(originalHost);
+        if (Array.isArray(addrs) && addrs.length > 0) {
+          ipv4Host = addrs[0];
+          console.log("✅ Resolved DB IPv4 via resolve4:", originalHost, "->", ipv4Host);
+        } else {
+          console.warn("⚠️ No A records via resolve4 for", originalHost);
+        }
+      } catch (err) {
+        console.warn("⚠️ dns.resolve4 failed:", err && err.message ? err.message : err);
       }
-    } catch (err) {
-      console.warn("⚠️ dns.resolve4 failed:", err && err.message ? err.message : err);
     }
 
     // 2) Fallback: dns.lookup family:4 (uses system resolver)
@@ -112,6 +112,9 @@ const db = {
 
     // Final host selection: prefer IPv4 if found, else use original hostname (may be IPv6-only)
     const hostToUse = ipv4Host || originalHost;
+    if (!ipv4Host) {
+      console.warn("⚠️ No IPv4 resolved for DB; falling back to hostname (this may attempt IPv6). Host used:", hostToUse);
+    }
 
     // Build pool options preferring IPv4 IP if found
     const poolOptions = {
@@ -131,28 +134,17 @@ const db = {
     console.log("✅ Postgres pool created and reachable (host used):", poolOptions.host);
   } catch (err) {
     console.error("❌ Failed to create Postgres pool:", err && err.message ? err.message : err);
-    // Do not exit process here so the app can start and surface errors in routes; uncomment next line to fail fast:
+    // Keep the process running so rest of service is available for debugging.
+    // If you prefer fail-fast (so deployment fails), uncomment next line:
     // process.exit(1);
   }
 })();
 
 // ---------- Plan config ----------
 const PLAN_CONFIG = {
-  basic: {
-    name: "Basic",
-    dailyQuota: 50,
-    features: { fullRag: false, summary: false },
-  },
-  pro: {
-    name: "Pro",
-    dailyQuota: 500,
-    features: { fullRag: true, summary: false },
-  },
-  advanced: {
-    name: "Advanced",
-    dailyQuota: 2000,
-    features: { fullRag: true, summary: true },
-  },
+  basic: { name: "Basic", dailyQuota: 50, features: { fullRag: false, summary: false } },
+  pro: { name: "Pro", dailyQuota: 500, features: { fullRag: true, summary: false } },
+  advanced: { name: "Advanced", dailyQuota: 2000, features: { fullRag: true, summary: true } },
 };
 
 // Demo site presets (auto-created when first used)
@@ -163,9 +155,7 @@ const DEMO_SITES = {
 };
 
 // ---------- Helpers ----------
-function todayISODate() {
-  return new Date().toISOString().slice(0, 10); // 'YYYY-MM-DD'
-}
+function todayISODate() { return new Date().toISOString().slice(0, 10); }
 
 async function getSiteByDomain(domain) {
   const result = await db.query("SELECT * FROM sites WHERE domain = $1", [domain]);
@@ -205,36 +195,29 @@ async function incrementUsage(siteId, dateStr) {
   return r.rows[0]?.count || 0;
 }
 
-// Simple RAG using knowledge_items (for Pro/Advanced)
+// Simple RAG
 async function getRagContextForSite(siteId, userText, limit = 5) {
   const text = (userText || "").slice(0, 200);
   if (!text) return "";
   const like = `%${text}%`;
-  const result = await db.query(
-    `SELECT title, content FROM knowledge_items WHERE site_id = $1 AND (title ILIKE $2 OR content ILIKE $2) ORDER BY created_at DESC LIMIT $3`,
-    [siteId, like, limit]
-  );
+  const result = await db.query("SELECT title, content FROM knowledge_items WHERE site_id = $1 AND (title ILIKE $2 OR content ILIKE $2) ORDER BY created_at DESC LIMIT $3", [siteId, like, limit]);
   if (!result.rows.length) return "";
-  return result.rows.map((row, idx) => `### ITEM ${idx + 1}: ${row.title}\n${row.content}`).join("\n\n");
+  return result.rows.map((row, idx) => `### ITEM ${idx+1}: ${row.title}\n${row.content}`).join("\n\n");
 }
 
-// Call OpenAI Chat API via axios
+// OpenAI Chat call
 async function callOpenAIChat(messages, { temperature = 0.6, max_tokens = 500 } = {}) {
   if (!OPENAI_API_KEY) {
     const e = new Error("OPENAI_API_KEY not set");
     e.code = "no_openai_key";
     throw e;
   }
-  const resp = await axios.post(
-    "https://api.openai.com/v1/chat/completions",
-    { model: "gpt-4o-mini", messages, temperature, max_tokens },
-    { timeout: 20000, headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` } }
-  );
+  const resp = await axios.post("https://api.openai.com/v1/chat/completions", { model: "gpt-4o-mini", messages, temperature, max_tokens }, { timeout: 20000, headers: { "Content-Type": "application/json", Authorization: `Bearer ${OPENAI_API_KEY}` } });
   const reply = resp?.data?.choices?.[0]?.message?.content?.trim() || resp?.data?.choices?.[0]?.text || "";
   return reply;
 }
 
-// Conversation summarization for Advanced plan (non-blocking)
+// Conversation summarization
 async function summarizeConversation(conversationId) {
   try {
     const result = await db.query("SELECT role, text FROM messages WHERE conversation_id = $1 ORDER BY created_at ASC LIMIT 30", [conversationId]);
@@ -252,60 +235,35 @@ async function summarizeConversation(conversationId) {
 // ---------- Middlewares ----------
 app.use(helmet({ contentSecurityPolicy: false, crossOriginResourcePolicy: { policy: "cross-origin" } }));
 app.use(express.json({ limit: "1mb" }));
+app.use(cors({ origin: "*", methods: ["GET","POST","OPTIONS"], allowedHeaders: ["Content-Type","Authorization"] }));
 
-// CORS - replace '*' with allowlist in production
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"], allowedHeaders: ["Content-Type", "Authorization"] }));
-
-// Logging
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
 app.use(morgan(":reqid :method :url :status - :response-time ms", { skip: (r) => r.path === "/health" }));
 
-// Rate limit AI & upload endpoints
-const limiter = rateLimit({
-  windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10),
-  max: parseInt(process.env.RATE_LIMIT_MAX || "8", 10),
-  standardHeaders: true,
-  legacyHeaders: false,
-});
+const limiter = rateLimit({ windowMs: parseInt(process.env.RATE_LIMIT_WINDOW_MS || "10000", 10), max: parseInt(process.env.RATE_LIMIT_MAX || "8", 10), standardHeaders: true, legacyHeaders: false });
 app.use("/chat", limiter);
 app.use("/mascot/upload", limiter);
 
 // ---------- Health ----------
 app.get("/", (_req, res) => res.status(200).send("OK"));
 app.get("/health", (_req, res) => res.json({ ok: true, service: "mascot-backend", time: new Date().toISOString() }));
-
 app.get("/health-db", async (_req, res) => {
-  try {
-    const r = await db.query("SELECT NOW()");
-    res.json({ ok: true, time: r.rows[0].now });
-  } catch (err) {
-    console.error("DB health error:", err && err.message ? err.message : err);
-    res.status(500).json({ ok: false, error: err && err.message ? err.message : String(err) });
-  }
+  try { const r = await db.query("SELECT NOW()"); res.json({ ok: true, time: r.rows[0].now }); } catch (err) { console.error("DB health error:", err && err.message ? err.message : err); res.status(500).json({ ok: false, error: err && err.message ? err.message : String(err) }); }
 });
 
 // ---------- Diagnostics ----------
 app.get("/openai/ping", async (_req, res) => {
-  try {
-    if (!OPENAI_API_KEY) return res.status(500).json({ ok: false, detail: "OPENAI_API_KEY not set" });
-    const r = await axios.get("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 10000 });
-    res.json({ ok: true, count: r.data?.data?.length || 0 });
-  } catch (e) {
-    const status = e?.response?.status || 500;
-    const detail = e?.response?.data || e.message;
-    res.status(status).json({ ok: false, detail });
-  }
+  try { if (!OPENAI_API_KEY) return res.status(500).json({ ok: false, detail: "OPENAI_API_KEY not set" }); const r = await axios.get("https://api.openai.com/v1/models", { headers: { Authorization: `Bearer ${OPENAI_API_KEY}` }, timeout: 10000 }); res.json({ ok: true, count: r.data?.data?.length || 0 }); } catch (e) { const status = e?.response?.status || 500; const detail = e?.response?.data || e.message; res.status(status).json({ ok: false, detail }); }
 });
 
-// Helpful message if someone GETs /chat in a browser
+// GET /chat helpful
 app.get("/chat", (_req, res) => res.status(405).json({ error: "Use POST /chat", example: { message: "Hello" } }));
 
-// ---------- Chat (OpenAI + RAG + per-site quota) ----------
+// ---------- Chat endpoint ----------
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = (req.body?.message || req.body?.text || "").toString().trim();
     if (!userMessage) return res.status(400).json({ error: "missing_text", message: "Missing 'message' or 'text' in body." });
-
     if (!OPENAI_API_KEY) return res.status(500).json({ reply: "⚠️ Server not configured with OPENAI_API_KEY." });
 
     const pageUrl = (req.body?.pageUrl || "").toString();
@@ -315,9 +273,7 @@ app.post("/chat", async (req, res) => {
     const originHeader = req.headers.origin || "";
 
     let siteDomain = siteRaw;
-    if (!siteDomain && originHeader) {
-      try { siteDomain = new URL(originHeader).hostname; } catch {}
-    }
+    if (!siteDomain && originHeader) { try { siteDomain = new URL(originHeader).hostname; } catch {} }
     if (!siteDomain) return res.status(400).json({ error: "unknown_site", message: "Site (domain) not provided. Please send 'site' in body or ensure Origin header is set." });
 
     let site = await getSiteByDomain(siteDomain);
@@ -329,74 +285,34 @@ app.post("/chat", async (req, res) => {
 
     const usage = await getOrCreateUsage(site.id, today);
     const effectiveQuota = site.daily_quota || planConf.dailyQuota;
-    if (usage.count >= effectiveQuota) {
-      return res.status(429).json({
-        error: "daily_limit_reached",
-        message: site.status === "demo" ? "Demo chat limit has been reached for today. Contact us to get full access." : "Daily chat limit has been reached for this site.",
-        remaining: 0,
-        reply: "Daily chat limit has been reached for this site. Please try again tomorrow."
-      });
-    }
+    if (usage.count >= effectiveQuota) return res.status(429).json({ error: "daily_limit_reached", message: site.status === "demo" ? "Demo chat limit has been reached for today. Contact us to get full access." : "Daily chat limit has been reached for this site.", remaining: 0, reply: "Daily chat limit has been reached for this site. Please try again tomorrow." });
 
     const sessionId = sessionIdRaw || `anon-${Date.now()}`;
     const conversation = await getOrCreateConversation(site.id, sessionId);
 
-    try {
-      await db.query("INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1, $2, $3, $4)", [conversation.id, "user", userMessage, pageUrl || null]);
-    } catch (e) {
-      console.warn("Failed to log user message:", e && e.message ? e.message : e);
-    }
+    try { await db.query("INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1,$2,$3,$4)", [conversation.id, "user", userMessage, pageUrl || null]); } catch (e) { console.warn("Failed to log user message:", e && e.message ? e.message : e); }
 
     const contextText = contextRaw.trim().slice(0, 3000) || "No specific page context was provided.";
     let extraRagContext = "";
-    if (planConf.features.fullRag) {
-      try { extraRagContext = await getRagContextForSite(site.id, userMessage); } catch (e) { console.warn("RAG context retrieval failed:", e && e.message ? e.message : e); extraRagContext = ""; }
-    }
+    if (planConf.features.fullRag) { try { extraRagContext = await getRagContextForSite(site.id, userMessage); } catch (e) { console.warn("RAG context retrieval failed:", e && e.message ? e.message : e); extraRagContext = ""; } }
 
     const baseSystemPrompt = site.plan === "advanced" ? "You are an advanced website assistant. Use website content and knowledge base. Act like a smart sales + support agent, but stay concise and clear." : site.plan === "pro" ? "You are a website assistant with access to a knowledge base. Use it to answer accurately and clearly." : "You are a simple helpful assistant for this website. Be concise and friendly.";
     const systemContext = "You are embedded on a website as a chat widget. Use the provided CONTEXT from the current page when it is relevant. If the context is not helpful, fall back to general knowledge but keep it relevant to this business.";
     const contextPrompt = ["CONTEXT FROM WEBSITE / APP:", `Site: ${siteDomain}`, `Page URL: ${pageUrl || "unknown"}`, "---", contextText, extraRagContext ? "\nADDITIONAL SITE KNOWLEDGE:\n" + extraRagContext : ""].join("\n");
 
-    const messages = [
-      { role: "system", content: baseSystemPrompt },
-      { role: "system", content: systemContext },
-      { role: "system", content: contextPrompt },
-      { role: "user", content: userMessage },
-    ];
+    const messages = [{ role: "system", content: baseSystemPrompt }, { role: "system", content: systemContext }, { role: "system", content: contextPrompt }, { role: "user", content: userMessage }];
 
     let reply;
-    try {
-      reply = await callOpenAIChat(messages, { temperature: 0.6, max_tokens: 500 });
-    } catch (err) {
-      const status = err?.response?.status || 502;
-      const code = err?.response?.data?.error?.code;
-      const friendly = code === "insufficient_quota" ? "⚠️ Demo usage limit reached. Please try again later." : "⚠️ I’m having trouble reaching the AI service. Please try again.";
-      console.error("OpenAI /chat error:", err?.response?.data || err.message || err);
-      return res.status(status).json({ reply: friendly });
-    }
+    try { reply = await callOpenAIChat(messages, { temperature: 0.6, max_tokens: 500 }); } catch (err) { const status = err?.response?.status || 502; const code = err?.response?.data?.error?.code; const friendly = code === "insufficient_quota" ? "⚠️ Demo usage limit reached. Please try again later." : "⚠️ I’m having trouble reaching the AI service. Please try again."; console.error("OpenAI /chat error:", err?.response?.data || err.message || err); return res.status(status).json({ reply: friendly }); }
 
-    try {
-      await db.query("INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1, $2, $3, $4)", [conversation.id, "assistant", reply, pageUrl || null]);
-    } catch (e) {
-      console.warn("Failed to log assistant message:", e && e.message ? e.message : e);
-    }
+    try { await db.query("INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1,$2,$3,$4)", [conversation.id, "assistant", reply, pageUrl || null]); } catch (e) { console.warn("Failed to log assistant message:", e && e.message ? e.message : e); }
 
-    try {
-      await db.query("UPDATE usage_daily SET count = count + 1 WHERE site_id = $1 AND date = $2", [site.id, today]);
-    } catch (e) {
-      console.warn("Failed to increment usage_daily:", e && e.message ? e.message : e);
-    }
+    try { await db.query("UPDATE usage_daily SET count = count + 1 WHERE site_id = $1 AND date = $2", [site.id, today]); } catch (e) { console.warn("Failed to increment usage_daily:", e && e.message ? e.message : e); }
     let newCount = usage.count + 1;
-    try {
-      const newUsage = await db.query("SELECT count FROM usage_daily WHERE site_id = $1 AND date = $2", [site.id, today]);
-      newCount = newUsage.rows[0]?.count ?? newCount;
-    } catch (e) {}
-
-    const effectiveQuotaLocal = site.daily_quota || planConf.dailyQuota;
-    const remaining = Math.max(effectiveQuotaLocal - newCount, 0);
+    try { const newUsage = await db.query("SELECT count FROM usage_daily WHERE site_id = $1 AND date = $2", [site.id, today]); newCount = newUsage.rows[0]?.count ?? newCount; } catch (e) {}
+    const remaining = Math.max((site.daily_quota || planConf.dailyQuota) - newCount, 0);
 
     if (planConf.features.summary) setImmediate(() => summarizeConversation(conversation.id));
-
     return res.json({ reply, remaining, plan: site.plan, status: site.status });
   } catch (err) {
     console.error("Unhandled /chat error:", err && err.message ? err.message : err);
@@ -404,12 +320,11 @@ app.post("/chat", async (req, res) => {
   }
 });
 
-// ---------- Mascot Upload (local storage) ----------
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } }); // 5MB
+// ---------- Upload ----------
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
 const UPLOAD_DIR = path.join(__dirname, "uploads");
 if (!fs.existsSync(UPLOAD_DIR)) fs.mkdirSync(UPLOAD_DIR);
 app.use("/uploads", express.static(UPLOAD_DIR));
-
 app.post("/mascot/upload", upload.single("mascot"), (req, res) => {
   try {
     if (!req.file) return res.status(400).json({ success: false, error: "No file uploaded. Field name 'mascot'." });
