@@ -1,5 +1,16 @@
 // server.js
-// Product-ready backend: multi-tenant, plans, quotas, RAG, summaries, demo auto-create.
+// Full-featured mascot chatbot backend
+// - Multi-tenant (sites table)
+// - Plans: basic / pro / advanced (RAG, summaries)
+// - Usage quotas (daily)
+// - Conversation & messages storage
+// - RAG context (knowledge_items)
+// - OpenAI Chat integration (axios)
+// - Upload endpoint (multer)
+// - Diagnostics: /health, /health-db, /openai/ping
+// - CORS, helmet, rate-limit, morgan
+// - Demo auto-create for demo-basic / demo-pro / demo-advanced
+// Keep this file updated and ensure env vars are set: DATABASE_URL, OPENAI_API_KEY
 
 const express = require("express");
 const cors = require("cors");
@@ -13,25 +24,21 @@ const path = require("path");
 const { Pool } = require("pg");
 require("dotenv").config();
 
-const app = express();
-
 // ---------- Config ----------
+const app = express();
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const DATABASE_URL = process.env.DATABASE_URL;
+const DATABASE_URL = process.env.DATABASE_URL || "";
 
 if (!DATABASE_URL) {
-  console.error("❌ Missing DATABASE_URL env var");
-  process.exit(1);
-}
-if (!OPENAI_API_KEY) {
-  console.error("⚠️ Warning: OPENAI_API_KEY not set. /chat will not work.");
+  console.warn("⚠️ DATABASE_URL not set — server will exit unless you intend demo/in-memory mode.");
+  // (we do not exit here; later flows might fail if DB is required)
 }
 
 // ---------- DB ----------
 const pool = new Pool({
   connectionString: DATABASE_URL,
-  // If you get SSL errors locally, uncomment:
+  // if you need to disable SSL verification locally, uncomment below:
   // ssl: { rejectUnauthorized: false },
 });
 
@@ -45,15 +52,15 @@ const PLAN_CONFIG = {
     name: "Basic",
     dailyQuota: 50,
     features: {
-      fullRag: false,  // no knowledge_items
-      summary: false,  // no conversation summary
+      fullRag: false, // no knowledge_items
+      summary: false,
     },
   },
   pro: {
     name: "Pro",
     dailyQuota: 500,
     features: {
-      fullRag: true,   // use knowledge_items
+      fullRag: true,
       summary: false,
     },
   },
@@ -62,7 +69,7 @@ const PLAN_CONFIG = {
     dailyQuota: 2000,
     features: {
       fullRag: true,
-      summary: true,   // generate conversation summary
+      summary: true,
     },
   },
 };
@@ -99,7 +106,6 @@ async function getSiteByDomain(domain) {
   return result.rows[0];
 }
 
-// Auto-create site only if it's one of the known demo IDs
 async function getOrCreateDemoSite(siteDomain) {
   const demoConfig = DEMO_SITES[siteDomain];
   if (!demoConfig) return null; // not a demo code we know
@@ -155,9 +161,16 @@ async function getOrCreateUsage(siteId, dateStr) {
   return insert.rows[0];
 }
 
+async function incrementUsage(siteId, dateStr) {
+  await db.query("UPDATE usage_daily SET count = count + 1 WHERE site_id = $1 AND date = $2", [siteId, dateStr]);
+  const r = await db.query("SELECT count FROM usage_daily WHERE site_id = $1 AND date = $2", [siteId, dateStr]);
+  return r.rows[0]?.count || 0;
+}
+
 // Simple RAG using knowledge_items (for Pro/Advanced)
 async function getRagContextForSite(siteId, userText, limit = 5) {
-  const text = userText.slice(0, 200); // crude but fine for V1
+  const text = (userText || "").slice(0, 200); // crude but fine for V1
+  if (!text) return "";
   const like = `%${text}%`;
 
   const result = await db.query(
@@ -183,6 +196,12 @@ async function getRagContextForSite(siteId, userText, limit = 5) {
 
 // Call OpenAI Chat API via axios
 async function callOpenAIChat(messages, { temperature = 0.6, max_tokens = 500 } = {}) {
+  if (!OPENAI_API_KEY) {
+    const e = new Error("OPENAI_API_KEY not set");
+    e.code = "no_openai_key";
+    throw e;
+  }
+
   const resp = await axios.post(
     "https://api.openai.com/v1/chat/completions",
     {
@@ -202,7 +221,9 @@ async function callOpenAIChat(messages, { temperature = 0.6, max_tokens = 500 } 
 
   const reply =
     resp?.data?.choices?.[0]?.message?.content?.trim() ||
-    "Sorry, I couldn’t generate a response.";
+    resp?.data?.choices?.[0]?.text ||
+    "";
+
   return reply;
 }
 
@@ -249,7 +270,7 @@ ${transcript}
       [summary, conversationId]
     );
   } catch (err) {
-    console.error("Summary error (non-blocking):", err.message);
+    console.error("Summary error (non-blocking):", err.message || err);
   }
 }
 
@@ -262,7 +283,7 @@ app.use(
 );
 app.use(express.json({ limit: "1mb" }));
 
-// TEMP: allow all origins (works everywhere). Tighten later with an allowlist.
+// CORS - replace '*' with allowlist in production
 app.use(
   cors({
     origin: "*",
@@ -271,7 +292,7 @@ app.use(
   })
 );
 
-// Logging (no bodies)
+// Logging (no bodies), add small token to track requests
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
 app.use(
   morgan(":reqid :method :url :status - :response-time ms", {
@@ -305,8 +326,8 @@ app.get("/health-db", async (_req, res) => {
     const r = await db.query("SELECT NOW()");
     res.json({ ok: true, time: r.rows[0].now });
   } catch (err) {
-    console.error("DB health error:", err.message);
-    res.status(500).json({ ok: false, error: err.message });
+    console.error("DB health error:", err.message || err);
+    res.status(500).json({ ok: false, error: err.message || String(err) });
   }
 });
 
@@ -337,7 +358,6 @@ app.get("/chat", (_req, res) =>
 );
 
 // ---------- Chat (OpenAI + RAG + per-site quota) ----------
-
 app.post("/chat", async (req, res) => {
   try {
     // support both old shape {message} and new {text}
@@ -420,10 +440,15 @@ app.post("/chat", async (req, res) => {
     const conversation = await getOrCreateConversation(site.id, sessionId);
 
     // 4) Log user message
-    await db.query(
-      "INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1, $2, $3, $4)",
-      [conversation.id, "user", userMessage, pageUrl || null]
-    );
+    try {
+      await db.query(
+        "INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1, $2, $3, $4)",
+        [conversation.id, "user", userMessage, pageUrl || null]
+      );
+    } catch (e) {
+      // If logging fails, continue — we mustn't block the user if DB write fails intermittently
+      console.warn("Failed to log user message:", e.message || e);
+    }
 
     // 5) Build context (Basic vs Pro/Advanced)
     const contextText =
@@ -432,7 +457,12 @@ app.post("/chat", async (req, res) => {
 
     let extraRagContext = "";
     if (planConf.features.fullRag) {
-      extraRagContext = await getRagContextForSite(site.id, userMessage);
+      try {
+        extraRagContext = await getRagContextForSite(site.id, userMessage);
+      } catch (e) {
+        console.warn("RAG context retrieval failed:", e.message || e);
+        extraRagContext = "";
+      }
     }
 
     const baseSystemPrompt =
@@ -478,31 +508,44 @@ app.post("/chat", async (req, res) => {
         code === "insufficient_quota"
           ? "⚠️ Demo usage limit reached. Please try again later."
           : "⚠️ I’m having trouble reaching the AI service. Please try again.";
-      console.error("OpenAI /chat error:", err?.response?.data || err.message);
+      console.error("OpenAI /chat error:", err?.response?.data || err.message || err);
       return res.status(status).json({ reply: friendly });
     }
 
     // 7) Log assistant reply
-    await db.query(
-      "INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1, $2, $3, $4)",
-      [conversation.id, "assistant", reply, pageUrl || null]
-    );
+    try {
+      await db.query(
+        "INSERT INTO messages (conversation_id, role, text, page_url) VALUES ($1, $2, $3, $4)",
+        [conversation.id, "assistant", reply, pageUrl || null]
+      );
+    } catch (e) {
+      console.warn("Failed to log assistant message:", e.message || e);
+    }
 
     // 8) Increment usage
-    await db.query(
-      "UPDATE usage_daily SET count = count + 1 WHERE site_id = $1 AND date = $2",
-      [site.id, today]
-    );
-    const newUsage = await db.query(
-      "SELECT count FROM usage_daily WHERE site_id = $1 AND date = $2",
-      [site.id, today]
-    );
-    const newCount = newUsage.rows[0]?.count ?? usage.count + 1;
+    try {
+      await db.query(
+        "UPDATE usage_daily SET count = count + 1 WHERE site_id = $1 AND date = $2",
+        [site.id, today]
+      );
+    } catch (e) {
+      console.warn("Failed to increment usage_daily:", e.message || e);
+    }
+    let newCount = usage.count + 1;
+    try {
+      const newUsage = await db.query(
+        "SELECT count FROM usage_daily WHERE site_id = $1 AND date = $2",
+        [site.id, today]
+      );
+      newCount = newUsage.rows[0]?.count ?? newCount;
+    } catch (e) {
+      // ignore; keep best-effort count
+    }
     const remaining = Math.max(effectiveQuota - newCount, 0);
 
     // 9) Advanced: summarize conversation (fire-and-forget)
     if (planConf.features.summary) {
-      summarizeConversation(conversation.id);
+      setImmediate(() => summarizeConversation(conversation.id));
     }
 
     return res.json({
@@ -538,12 +581,12 @@ app.post("/mascot/upload", upload.single("mascot"), (req, res) => {
     fs.writeFileSync(path.join(UPLOAD_DIR, safeName), req.file.buffer);
     return res.json({ success: true, url: `/uploads/${safeName}` });
   } catch (e) {
-    console.error("Upload error:", e.message);
+    console.error("Upload error:", e.message || e);
     return res.status(500).json({ success: false, error: "Upload failed." });
   }
 });
 
 // ---------- Start ----------
 app.listen(PORT, () =>
-  console.log(`✅ Server running on port ${PORT}`)
+  console.log(`✅ Server running on port ${PORT} (mascot-backend). OpenAI key ${OPENAI_API_KEY ? "present" : "MISSING"}`)
 );
