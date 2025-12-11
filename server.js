@@ -21,7 +21,6 @@ const morgan = require("morgan");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const { Pool } = require("pg");
 require("dotenv").config();
 
 // ---------- Config ----------
@@ -35,16 +34,67 @@ if (!DATABASE_URL) {
   // (we do not exit here; later flows might fail if DB is required)
 }
 
-// ---------- DB ----------
-const pool = new Pool({
-  connectionString: DATABASE_URL,
-  // if you need to disable SSL verification locally, uncomment below:
-  // ssl: { rejectUnauthorized: false },
-});
+// ---------- DB (with IPv4 resolution to avoid ENETUNREACH on IPv6-only hosts) ----------
+const dns = require("dns").promises;
+const { URL } = require("url");
 
+let pool = null;
+
+// lightweight db wrapper used by routes; will delegate to `pool` once ready.
+// If pool isn't ready yet, queries will throw a clear error to surface issues early.
 const db = {
-  query: (text, params) => pool.query(text, params),
+  query: (text, params) => {
+    if (!pool) throw new Error("Postgres pool not initialized yet");
+    return pool.query(text, params);
+  },
 };
+
+(async function initPostgresPool() {
+  try {
+    if (!DATABASE_URL) {
+      console.warn("⚠️ DATABASE_URL not set — pool cannot be created.");
+      return;
+    }
+
+    const parsed = new URL(DATABASE_URL);
+    const originalHost = parsed.hostname;
+    let ipv4Host = null;
+
+    try {
+      const addrs = await dns.resolve4(originalHost);
+      if (Array.isArray(addrs) && addrs.length > 0) {
+        ipv4Host = addrs[0];
+        console.log("✅ Resolved DB IPv4:", originalHost, "->", ipv4Host);
+      } else {
+        console.warn("⚠️ No IPv4 A records found for", originalHost);
+      }
+    } catch (dnsErr) {
+      console.warn("⚠️ dns.resolve4 failed (will try hostname):", dnsErr && dnsErr.message ? dnsErr.message : dnsErr);
+    }
+
+    // Build pool config preferring ipv4Host if available
+    const poolOptions = {
+      user: parsed.username || undefined,
+      password: parsed.password || undefined,
+      host: ipv4Host || originalHost,
+      port: parsed.port || 5432,
+      database: parsed.pathname ? parsed.pathname.slice(1) : undefined,
+      ssl: parsed.searchParams.get("sslmode") === "require" ? { rejectUnauthorized: false } : undefined,
+    };
+
+    // Create the pool
+    const { Pool } = require("pg");
+    pool = new Pool(poolOptions);
+
+    // quick test to fail early if DB still unreachable
+    await pool.query("SELECT 1");
+    console.log("✅ Postgres pool created and reachable (host used):", poolOptions.host);
+  } catch (err) {
+    console.error("❌ Failed to create Postgres pool:", err && err.message ? err.message : err);
+    // If you'd rather fail fast, uncomment next line:
+    // process.exit(1);
+  }
+})();
 
 // ---------- Plan config ----------
 const PLAN_CONFIG = {
