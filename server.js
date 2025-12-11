@@ -2,7 +2,7 @@
 // Full-featured mascot chatbot backend
 // - preserves all original routes & features (multi-tenant, plans, RAG, summarization, uploads, diagnostics)
 // - robust DB init: PGHOST_IPV4 env override -> resolve4 -> lookup(family:4) -> DoH -> hostname
-// - trust proxy enabled (fixes X-Forwarded-For / express-rate-limit)
+// - Neon SNI fix: ensure options=endpoint=<endpoint-id> param is present even when using IPv4
 // Keep env vars: DATABASE_URL, OPENAI_API_KEY. Optionally set PGHOST_IPV4 to force IPv4.
 
 const express = require("express");
@@ -25,15 +25,15 @@ app.set("trust proxy", true);
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const DATABASE_URL = process.env.DATABASE_URL || "";
+const RAW_DATABASE_URL = process.env.DATABASE_URL || ""; // note: raw env
 // Optional override: set this in Railway env to force IPv4 host
 const PGHOST_IPV4 = process.env.PGHOST_IPV4 || "";
 
-if (!DATABASE_URL) {
+if (!RAW_DATABASE_URL) {
   console.warn("⚠️ DATABASE_URL not set — server will proceed but DB calls will fail.");
 }
 
-// ---------- DB init (robust IPv4 resolution with PGHOST_IPV4 override) ----------
+// ---------- DB init (Neon-aware, robust IPv4 resolution with PGHOST_IPV4 override) ----------
 let pool = null;
 const db = {
   query: (text, params) => {
@@ -42,30 +42,86 @@ const db = {
   },
 };
 
+/**
+ * Ensure Neon connection string contains options=endpoint=<endpoint-id> and sslmode=require.
+ * If ipv4Host is provided (an IP), we replace hostname with the IP but KEEP the endpoint option derived from original host.
+ *
+ * Returns: finalConnectionString (string) or null if invalid input.
+ */
+function buildNeonConnectionString(raw, ipv4HostFallback) {
+  if (!raw) return null;
+  // Trim and remove surrounding quotes or stray single-quotes
+  let u = raw.trim().replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1");
+
+  let parsed;
+  try {
+    parsed = new URL(u);
+  } catch (e) {
+    console.error("❌ buildNeonConnectionString: invalid DATABASE_URL format:", e.message);
+    return null;
+  }
+
+  // Extract original hostname and endpoint id (for Neon pooler hostnames)
+  const originalHost = parsed.hostname; // e.g. ep-polished-sky-a12jufhs-pooler.ap-...
+  const firstLabel = originalHost.split(".")[0] || "";
+  // endpoint id is firstLabel without trailing "-pooler" (if present)
+  const endpointId = firstLabel.replace(/-pooler$/i, "");
+
+  // Ensure sslmode=require if not already present
+  const params = parsed.searchParams;
+  if (!params.has("sslmode")) params.set("sslmode", "require");
+
+  // Ensure options param set to endpoint=<endpoint-id>
+  if (endpointId) {
+    // set will URL-encode value when we reserialize
+    params.set("options", `endpoint=${endpointId}`);
+  }
+
+  // If caller provided an IPv4 host, override hostname with it (keep port & auth & db path)
+  if (ipv4HostFallback && ipv4HostFallback.match(/^\d{1,3}(\.\d{1,3}){3}$/)) {
+    parsed.hostname = ipv4HostFallback;
+    // Note: URL will preserve port and credentials
+  }
+
+  // Reassign search params (ensures encoding)
+  parsed.search = params.toString();
+  return parsed.toString();
+}
+
 (async function initPostgresPool() {
   try {
-    if (!DATABASE_URL) {
+    if (!RAW_DATABASE_URL) {
       console.warn("⚠️ DATABASE_URL not set — pool cannot be created.");
       return;
     }
 
-    const parsed = new URL(DATABASE_URL);
-    const originalHost = parsed.hostname;
-    let ipv4Host = null;
+    // Parse the raw URL to identify original host (for endpoint extraction)
+    const parsedRaw = (() => {
+      try { return new URL(RAW_DATABASE_URL.trim().replace(/^"(.*)"$/, "$1").replace(/^'(.*)'$/, "$1")); }
+      catch (e) { console.error("❌ Invalid RAW DATABASE_URL:", e.message); return null; }
+    })();
 
-    // 0) Highest priority: use PGHOST_IPV4 if provided (set in Railway env)
+    if (!parsedRaw) {
+      console.error("❌ Aborting DB init: invalid RAW DATABASE_URL.");
+      return;
+    }
+
+    const originalHost = parsedRaw.hostname;
+    let resolvedIPv4 = null;
+
+    // 0) Highest priority: PGHOST_IPV4 override (explicit IP string)
     if (PGHOST_IPV4 && PGHOST_IPV4.match(/^\d{1,3}(\.\d{1,3}){3}$/)) {
-      ipv4Host = PGHOST_IPV4;
-      console.log("✅ Using PGHOST_IPV4 override:", ipv4Host);
+      resolvedIPv4 = PGHOST_IPV4;
+      console.log("✅ Using PGHOST_IPV4 override:", resolvedIPv4);
     }
 
     // 1) Try dns.resolve4 (direct A-record query)
-    if (!ipv4Host) {
+    if (!resolvedIPv4) {
       try {
         const addrs = await dns.resolve4(originalHost);
         if (Array.isArray(addrs) && addrs.length > 0) {
-          ipv4Host = addrs[0];
-          console.log("✅ Resolved DB IPv4 via resolve4:", originalHost, "->", ipv4Host);
+          resolvedIPv4 = addrs[0];
+          console.log("✅ Resolved DB IPv4 via resolve4:", originalHost, "->", resolvedIPv4);
         } else {
           console.warn("⚠️ No A records via resolve4 for", originalHost);
         }
@@ -75,12 +131,12 @@ const db = {
     }
 
     // 2) Fallback: dns.lookup family:4 (uses system resolver)
-    if (!ipv4Host) {
+    if (!resolvedIPv4) {
       try {
         const lk = await dns.lookup(originalHost, { family: 4 });
         if (lk && lk.address) {
-          ipv4Host = lk.address;
-          console.log("✅ Resolved DB IPv4 via lookup:", originalHost, "->", ipv4Host);
+          resolvedIPv4 = lk.address;
+          console.log("✅ Resolved DB IPv4 via lookup:", originalHost, "->", resolvedIPv4);
         }
       } catch (err) {
         console.warn("⚠️ dns.lookup family:4 failed:", err && err.message ? err.message : err);
@@ -88,7 +144,7 @@ const db = {
     }
 
     // 3) Fallback: DoH via Google (dns.google)
-    if (!ipv4Host) {
+    if (!resolvedIPv4) {
       try {
         const dohUrl = `https://dns.google/resolve?name=${encodeURIComponent(originalHost)}&type=A`;
         const dohResp = await axios.get(dohUrl, { timeout: 5000 });
@@ -97,8 +153,8 @@ const db = {
           for (const a of answers) {
             const ip = a.data || a;
             if (typeof ip === "string" && ip.match(/^\d{1,3}(\.\d{1,3}){3}$/)) {
-              ipv4Host = ip;
-              console.log("✅ Resolved DB IPv4 via DoH (dns.google):", originalHost, "->", ipv4Host);
+              resolvedIPv4 = ip;
+              console.log("✅ Resolved DB IPv4 via DoH (dns.google):", originalHost, "->", resolvedIPv4);
               break;
             }
           }
@@ -110,28 +166,34 @@ const db = {
       }
     }
 
-    // Final host selection: prefer IPv4 if found, else use original hostname (may be IPv6-only)
-    const hostToUse = ipv4Host || originalHost;
-    if (!ipv4Host) {
-      console.warn("⚠️ No IPv4 resolved for DB; falling back to hostname (this may attempt IPv6). Host used:", hostToUse);
+    // Build final connection string:
+    // If we have a resolved IPv4, pass it to builder so it uses IP but still includes `options=endpoint=...`
+    const finalConnString = buildNeonConnectionString(RAW_DATABASE_URL, resolvedIPv4);
+
+    // For debug: log raw env and final conn string (password redacted)
+    console.log("🔍 RAW process.env.DATABASE_URL:", JSON.stringify(RAW_DATABASE_URL));
+    console.log("🔧 Final DATABASE_URL used (password redacted):", finalConnString ? finalConnString.replace(/:\/\/([^:]+):([^@]+)@/, "://$1:REDACTED@") : null);
+
+    if (!finalConnString) {
+      console.error("❌ Final connection string could not be constructed. Pool will not be created.");
+      return;
     }
 
-    // Build pool options preferring IPv4 IP if found
-    const poolOptions = {
-      user: parsed.username || undefined,
-      password: parsed.password || undefined,
-      host: hostToUse,
-      port: parsed.port || 5432,
-      database: parsed.pathname ? parsed.pathname.slice(1) : undefined,
-      ssl: parsed.searchParams.get("sslmode") === "require" ? { rejectUnauthorized: false } : undefined,
-    };
-
+    // Create pg Pool using connectionString (safer for Neon SNI requirements)
     const { Pool } = require("pg");
-    pool = new Pool(poolOptions);
+    pool = new Pool({
+      connectionString: finalConnString,
+      ssl: { rejectUnauthorized: false }, // Neon friendly
+      allowExitOnIdle: true,
+    });
 
     // quick test to fail early if DB still unreachable
-    await pool.query("SELECT 1");
-    console.log("✅ Postgres pool created and reachable (host used):", poolOptions.host);
+    try {
+      await pool.query("SELECT 1");
+      console.log("✅ Postgres pool created and reachable (final host used):", resolvedIPv4 || originalHost);
+    } catch (err) {
+      console.error("❌ Postgres test query failed after creating pool:", err && err.message ? err.message : err);
+    }
   } catch (err) {
     console.error("❌ Failed to create Postgres pool:", err && err.message ? err.message : err);
     // Keep the process running so rest of service is available for debugging.
