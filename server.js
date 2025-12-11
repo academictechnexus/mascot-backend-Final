@@ -65,7 +65,7 @@ function buildNeonConnectionString(raw, ipv4HostFallback) {
   const originalHost = parsed.hostname; // e.g. ep-polished-sky-a12jufhs-pooler.ap-...
   const firstLabel = originalHost.split(".")[0] || "";
   // endpoint id is firstLabel without trailing "-pooler" (if present)
-  const endpointId = firstLabel.replace(/-pooler$/i, "");
+  const endpointId = firstLabel; // keep '-pooler' suffix if present to match SNI/project name
 
   // Ensure sslmode=require if not already present
   const params = parsed.searchParams;
