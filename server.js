@@ -167,8 +167,13 @@ function buildNeonConnectionString(raw, ipv4HostFallback) {
     }
 
     // Build final connection string:
-    // If we have a resolved IPv4, pass it to builder so it uses IP but still includes `options=endpoint=...`
-    const finalConnString = buildNeonConnectionString(RAW_DATABASE_URL, resolvedIPv4);
+    // NOTE: Use the original Neon hostname in the final connection string so TLS SNI matches the certificate.
+    // We still resolve and log the IPv4 (resolvedIPv4) for debugging/visibility, but DO NOT replace hostname with IP.
+    const finalConnString = buildNeonConnectionString(RAW_DATABASE_URL, null);
+
+    if (resolvedIPv4) {
+      console.log("ℹ️ Resolved IPv4 (not used for TLS hostname):", resolvedIPv4);
+    }
 
     // For debug: log raw env and final conn string (password redacted)
     console.log("🔍 RAW process.env.DATABASE_URL:", JSON.stringify(RAW_DATABASE_URL));
@@ -179,7 +184,7 @@ function buildNeonConnectionString(raw, ipv4HostFallback) {
       return;
     }
 
-    // --- Create pg Pool using connectionString (Neon + IPv4 + SNI fix) ---
+    // --- Create pg Pool using connectionString (Neon + SNI preserved) ---
     const { Pool } = require("pg");
 
     // build sslOptions and set servername for SNI so cert alt names match
@@ -193,7 +198,7 @@ function buildNeonConnectionString(raw, ipv4HostFallback) {
     }
 
     pool = new Pool({
-      connectionString: finalConnString,       // contains options=endpoint=... and may contain IP host
+      connectionString: finalConnString,       // contains hostname and options=endpoint=...
       ssl: sslOptions,                         // ensure servername set to originalHost for SNI
       allowExitOnIdle: true,
     });
@@ -201,7 +206,7 @@ function buildNeonConnectionString(raw, ipv4HostFallback) {
     // quick test to fail early if DB still unreachable
     try {
       await pool.query("SELECT 1");
-      console.log("✅ Postgres pool created and reachable (final host used):", resolvedIPv4 || originalHost);
+      console.log("✅ Postgres pool created and reachable (final host used):", originalHost);
     } catch (err) {
       console.error("❌ Postgres test query failed after creating pool:", err && err.message ? err.message : err);
     }
