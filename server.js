@@ -2,7 +2,7 @@
 // Full-featured mascot chatbot backend
 // - preserves all original routes & features (multi-tenant, plans, RAG, summarization, uploads, diagnostics)
 // - robust DB init: PGHOST_IPV4 env override -> resolve4 -> lookup(family:4) -> DoH -> hostname
-// - Neon SNI fix: ensure options=endpoint=<endpoint-id> param is present even when using IPv4
+// - Neon SNI fix: ensure ssl.servername set to original hostname so TLS cert matches when using IPv4
 // Keep env vars: DATABASE_URL, OPENAI_API_KEY. Optionally set PGHOST_IPV4 to force IPv4.
 
 const express = require("express");
@@ -179,11 +179,22 @@ function buildNeonConnectionString(raw, ipv4HostFallback) {
       return;
     }
 
-    // Create pg Pool using connectionString (safer for Neon SNI requirements)
+    // --- Create pg Pool using connectionString (Neon + IPv4 + SNI fix) ---
     const { Pool } = require("pg");
+
+    // build sslOptions and set servername for SNI so cert alt names match
+    const sslOptions = { rejectUnauthorized: false };
+    try {
+      if (parsedRaw && parsedRaw.hostname) {
+        sslOptions.servername = parsedRaw.hostname; // important: set to Neon hostname for SNI
+      }
+    } catch (e) {
+      // no-op
+    }
+
     pool = new Pool({
-      connectionString: finalConnString,
-      ssl: { rejectUnauthorized: false }, // Neon friendly
+      connectionString: finalConnString,       // contains options=endpoint=... and may contain IP host
+      ssl: sslOptions,                         // ensure servername set to originalHost for SNI
       allowExitOnIdle: true,
     });
 
