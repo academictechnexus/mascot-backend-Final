@@ -1,6 +1,5 @@
 // server.js
-// Mascot backend — FINAL integrated version
-// Zendesk-style backend for SMBs (SAFE, NON-BREAKING)
+// Mascot backend — FINAL CLEAN VERSION (USERNAME LOGIN)
 
 const express = require("express");
 const cors = require("cors");
@@ -11,7 +10,6 @@ const morgan = require("morgan");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const dns = require("dns").promises;
 const crypto = require("crypto");
 const { URL } = require("url");
 require("dotenv").config();
@@ -25,67 +23,28 @@ const channelRoutes = require("./routes/channel.routes");
 const reportsRoutes = require("./routes/reports.routes");
 
 /* ===========================
-   OPTIONAL LIBS
+   APP SETUP
 =========================== */
-let nodemailer = null;
-try {
-  nodemailer = require("nodemailer");
-} catch (e) {}
-
-let stripe = null;
-if (process.env.STRIPE_SECRET_KEY) {
-  try {
-    stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
-  } catch (e) {
-    stripe = null;
-  }
-}
-
 const app = express();
 app.set("trust proxy", true);
 
 const PORT = process.env.PORT || 8080;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const RAW_DATABASE_URL = process.env.DATABASE_URL || "";
-const DEMO_DAYS = parseInt(process.env.DEMO_DAYS || "7", 10);
-const RECAPTCHA_SECRET = process.env.RECAPTCHA_SECRET || null;
 
 /* ===========================
-   ADMIN AUTH CONFIG (NEW)
+   ADMIN AUTH CONFIG
 =========================== */
-const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
+const ADMIN_SECRET =
+  process.env.ADMIN_SECRET ||
+  process.env.ADMIN_JWT_SECRET ||
+  "";
 
 function hashPassword(password) {
   return crypto
     .createHash("sha256")
     .update(password + ADMIN_SECRET)
     .digest("hex");
-}
-
-/* ===========================
-   EMAIL CONFIG
-=========================== */
-const SMTP_ENABLED = !!(
-  process.env.SMTP_HOST &&
-  process.env.SMTP_PORT &&
-  process.env.SMTP_USER &&
-  process.env.SMTP_PASS &&
-  process.env.EMAIL_FROM
-);
-
-const EMAIL_FROM = process.env.EMAIL_FROM || "no-reply@example.com";
-let mailTransporter = null;
-
-if (SMTP_ENABLED && nodemailer) {
-  mailTransporter = nodemailer.createTransport({
-    host: process.env.SMTP_HOST,
-    port: Number(process.env.SMTP_PORT),
-    secure: Number(process.env.SMTP_PORT) === 465,
-    auth: {
-      user: process.env.SMTP_USER,
-      pass: process.env.SMTP_PASS
-    }
-  });
 }
 
 /* ===========================
@@ -100,13 +59,12 @@ app.use(morgan(":reqid :method :url :status :response-time ms"));
 
 const limiter = rateLimit({
   windowMs: 10_000,
-  max: 8,
+  max: 10,
   standardHeaders: true,
   legacyHeaders: false
 });
 
 app.use("/chat", limiter);
-app.use("/site/request-demo", limiter);
 app.use("/mascot/upload", limiter);
 app.use("/admin/auth/login", limiter);
 
@@ -116,15 +74,6 @@ app.use("/admin/auth/login", limiter);
 app.use("/onboarding", onboardingRoutes);
 app.use("/channels", channelRoutes);
 app.use("/reports", reportsRoutes);
-
-/* ===========================
-   PLANS
-=========================== */
-const PLAN_CONFIG = {
-  basic: { dailyQuota: 50 },
-  pro: { dailyQuota: null },
-  advanced: { dailyQuota: null }
-};
 
 /* ===========================
    DB INIT
@@ -153,9 +102,6 @@ function buildNeonConnectionString(raw) {
   });
 })();
 
-/* ===========================
-   ADMIN LOGIN (NEW)
-=========================== */
 /* ===========================
    ADMIN LOGIN (USERNAME BASED)
 =========================== */
@@ -196,39 +142,6 @@ app.post("/admin/auth/login", async (req, res) => {
         id: admin.id,
         username: admin.username,
         role: admin.role
-      }
-    });
-  } catch (err) {
-    console.error("Admin login error", err);
-    return res.status(500).json({ error: "server_error" });
-  }
-});
-
-    const passwordHash = hashPassword(password);
-
-    const result = await db.query(
-      `SELECT id, email, is_active
-       FROM admins
-       WHERE email = $1
-         AND password_hash = $2
-       LIMIT 1`,
-      [email.toLowerCase(), passwordHash]
-    );
-
-    const admin = result.rows[0];
-
-    if (!admin || !admin.is_active) {
-      return res.status(401).json({
-        error: "invalid_credentials",
-        message: "Invalid email or password"
-      });
-    }
-
-    return res.json({
-      success: true,
-      admin: {
-        id: admin.id,
-        email: admin.email
       }
     });
   } catch (err) {
