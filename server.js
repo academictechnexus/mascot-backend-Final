@@ -156,16 +156,53 @@ function buildNeonConnectionString(raw) {
 /* ===========================
    ADMIN LOGIN (NEW)
 =========================== */
+/* ===========================
+   ADMIN LOGIN (USERNAME BASED)
+=========================== */
 app.post("/admin/auth/login", async (req, res) => {
   try {
-    const { email, password } = req.body || {};
+    const { username, password } = req.body || {};
 
-    if (!email || !password) {
+    if (!username || !password) {
       return res.status(400).json({
         error: "missing_credentials",
-        message: "Email and password are required"
+        message: "Username and password are required"
       });
     }
+
+    const passwordHash = hashPassword(password);
+
+    const result = await db.query(
+      `SELECT id, username, role
+       FROM admins
+       WHERE username = $1
+         AND password_hash = $2
+       LIMIT 1`,
+      [username, passwordHash]
+    );
+
+    const admin = result.rows[0];
+
+    if (!admin) {
+      return res.status(401).json({
+        error: "invalid_credentials",
+        message: "Invalid username or password"
+      });
+    }
+
+    return res.json({
+      success: true,
+      admin: {
+        id: admin.id,
+        username: admin.username,
+        role: admin.role
+      }
+    });
+  } catch (err) {
+    console.error("Admin login error", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
 
     const passwordHash = hashPassword(password);
 
