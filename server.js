@@ -1,5 +1,6 @@
 // server.js
-// Mascot backend — FINAL CLEAN VERSION (USERNAME LOGIN)
+// Mascot backend — FINAL STABLE VERSION
+// Username-based admin login + Supabase/Neon safe DB connection
 
 const express = require("express");
 const cors = require("cors");
@@ -76,9 +77,10 @@ app.use("/channels", channelRoutes);
 app.use("/reports", reportsRoutes);
 
 /* ===========================
-   DB INIT
+   DB INIT (NEON / SUPABASE SAFE)
 =========================== */
 let pool = null;
+
 const db = {
   query: (q, p) => {
     if (!pool) throw new Error("DB not ready");
@@ -86,20 +88,26 @@ const db = {
   }
 };
 
-function buildNeonConnectionString(raw) {
+// 🔴 IMPORTANT FIX: DO NOT MODIFY DATABASE_URL
+function buildConnectionString(raw) {
   if (!raw) return null;
-  const u = new URL(raw.replace(/^['"]|['"]$/g, ""));
-  u.searchParams.set("sslmode", "require");
-  return u.toString();
+  return raw.replace(/^['"]|['"]$/g, "");
 }
 
 (async function initDB() {
-  if (!RAW_DATABASE_URL) return;
+  if (!RAW_DATABASE_URL) {
+    console.warn("⚠️ DATABASE_URL not set");
+    return;
+  }
+
   const { Pool } = require("pg");
+
   pool = new Pool({
-    connectionString: buildNeonConnectionString(RAW_DATABASE_URL),
+    connectionString: buildConnectionString(RAW_DATABASE_URL),
     ssl: { rejectUnauthorized: false }
   });
+
+  console.log("✅ Database pool initialized");
 })();
 
 /* ===========================
@@ -145,13 +153,13 @@ app.post("/admin/auth/login", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Admin login error", err);
+    console.error("Admin login error:", err.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
 
 /* ===========================
-   CHAT ENDPOINT
+   CHAT ENDPOINT (UNCHANGED)
 =========================== */
 app.post("/chat", async (req, res) => {
   try {
@@ -226,7 +234,7 @@ app.post("/chat", async (req, res) => {
       finalReply = wfResult.reply;
       ticketId = wfResult.ticketId || null;
     } catch (e) {
-      console.warn("chat.workflow failed", e.message);
+      console.warn("chat.workflow failed:", e.message);
     }
 
     return res.json({
@@ -236,7 +244,7 @@ app.post("/chat", async (req, res) => {
       status: site.status
     });
   } catch (err) {
-    console.error("Chat error", err);
+    console.error("Chat error:", err.message);
     return res.status(500).json({ error: "server_error" });
   }
 });
