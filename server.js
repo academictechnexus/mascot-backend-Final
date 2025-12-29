@@ -1,5 +1,6 @@
 // server.js
-// Mascot backend — FINAL VERSION (Neon + bcrypt + Railway safe)
+// Mascot backend — FINAL PRODUCTION VERSION
+// Neon + bcrypt + JWT + Railway safe
 
 const express = require("express");
 const cors = require("cors");
@@ -11,6 +12,7 @@ const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
 const bcrypt = require("bcrypt");
+const jwt = require("jsonwebtoken");
 const { URL } = require("url");
 require("dotenv").config();
 
@@ -27,15 +29,13 @@ const reportsRoutes = require("./routes/reports.routes");
 =========================== */
 const app = express();
 
-/**
- * REQUIRED for Railway + Cloudflare
- * (fixes express-rate-limit warning)
- */
+// Required for Railway + Cloudflare + rate-limit
 app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const DATABASE_URL = process.env.DATABASE_URL || "";
+const JWT_SECRET = process.env.ADMIN_JWT_SECRET;
 
 /* ===========================
    MIDDLEWARE
@@ -83,7 +83,6 @@ const db = {
     return;
   }
 
-  // 🔎 Log host once (helps confirm NOT pooler)
   console.log("🔎 DATABASE_URL HOST:", new URL(DATABASE_URL).host);
 
   const { Pool } = require("pg");
@@ -94,7 +93,7 @@ const db = {
 })();
 
 /* ===========================
-   ADMIN LOGIN (bcrypt-based)
+   ADMIN LOGIN (JWT + bcrypt)
 =========================== */
 app.post("/admin/auth/login", async (req, res) => {
   try {
@@ -124,17 +123,28 @@ app.post("/admin/auth/login", async (req, res) => {
       });
     }
 
-    const isValid = await bcrypt.compare(password, admin.password_hash);
+    const valid = await bcrypt.compare(password, admin.password_hash);
 
-    if (!isValid) {
+    if (!valid) {
       return res.status(401).json({
         error: "invalid_credentials",
         message: "Invalid username or password"
       });
     }
 
+    const token = jwt.sign(
+      {
+        id: admin.id,
+        username: admin.username,
+        role: admin.role
+      },
+      JWT_SECRET,
+      { expiresIn: "12h" }
+    );
+
     return res.json({
       success: true,
+      token,
       admin: {
         id: admin.id,
         username: admin.username,
