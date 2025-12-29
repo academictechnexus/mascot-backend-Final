@@ -1,6 +1,5 @@
 // server.js
-// Mascot backend — FINAL STABLE VERSION
-// Username-based admin login + Supabase/Neon safe DB connection
+// Mascot backend — FINAL STABLE VERSION (Railway + Supabase safe)
 
 const express = require("express");
 const cors = require("cors");
@@ -27,9 +26,15 @@ const reportsRoutes = require("./routes/reports.routes");
    APP SETUP
 =========================== */
 const app = express();
-app.set("trust proxy", true);
 
-const PORT = process.env.PORT || 8080;
+/**
+ * IMPORTANT:
+ * Railway + Cloudflare require trust proxy = 1
+ * NOT true
+ */
+app.set("trust proxy", 1);
+
+const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
 const RAW_DATABASE_URL = process.env.DATABASE_URL || "";
 
@@ -77,22 +82,15 @@ app.use("/channels", channelRoutes);
 app.use("/reports", reportsRoutes);
 
 /* ===========================
-   DB INIT (NEON / SUPABASE SAFE)
+   DB INIT (SUPABASE / NEON SAFE)
 =========================== */
 let pool = null;
-
 const db = {
   query: (q, p) => {
     if (!pool) throw new Error("DB not ready");
     return pool.query(q, p);
   }
 };
-
-// 🔴 IMPORTANT FIX: DO NOT MODIFY DATABASE_URL
-function buildConnectionString(raw) {
-  if (!raw) return null;
-  return raw.replace(/^['"]|['"]$/g, "");
-}
 
 (async function initDB() {
   if (!RAW_DATABASE_URL) {
@@ -102,9 +100,10 @@ function buildConnectionString(raw) {
 
   const { Pool } = require("pg");
 
+  // 🔴 CRITICAL FIX:
+  // Do NOT override SSL or mutate URL for Supabase pooler
   pool = new Pool({
-    connectionString: buildConnectionString(RAW_DATABASE_URL),
-    ssl: { rejectUnauthorized: false }
+    connectionString: RAW_DATABASE_URL
   });
 
   console.log("✅ Database pool initialized");
@@ -188,16 +187,14 @@ app.post("/chat", async (req, res) => {
 
     const sessionId = req.body.sessionId || `anon-${Date.now()}`;
 
-    const messages = [
-      { role: "system", content: "You are a helpful website assistant." },
-      { role: "user", content: userMessage }
-    ];
-
     const aiResp = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
         model: "gpt-4o-mini",
-        messages,
+        messages: [
+          { role: "system", content: "You are a helpful website assistant." },
+          { role: "user", content: userMessage }
+        ],
         temperature: 0.6,
         max_tokens: 500
       },
@@ -209,39 +206,8 @@ app.post("/chat", async (req, res) => {
       }
     );
 
-    const aiReply =
-      aiResp.data?.choices?.[0]?.message?.content || "";
-
-    let finalReply = aiReply;
-    let ticketId = null;
-
-    try {
-      const wfResult = await chatWorkflow.handleChat({
-        pool,
-        site,
-        channel: "web",
-        sessionId,
-        userMessage,
-        aiReply,
-        conversationLog: [
-          { role: "user", text: userMessage },
-          { role: "assistant", text: aiReply }
-        ],
-        contextUsed: false,
-        customerContact: null
-      });
-
-      finalReply = wfResult.reply;
-      ticketId = wfResult.ticketId || null;
-    } catch (e) {
-      console.warn("chat.workflow failed:", e.message);
-    }
-
     return res.json({
-      reply: finalReply,
-      ticketId,
-      plan: site.plan,
-      status: site.status
+      reply: aiResp.data?.choices?.[0]?.message?.content || ""
     });
   } catch (err) {
     console.error("Chat error:", err.message);
