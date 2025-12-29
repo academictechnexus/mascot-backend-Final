@@ -1,5 +1,5 @@
 // server.js
-// Mascot backend — FINAL STABLE VERSION (Railway + Supabase safe)
+// Mascot backend — FINAL VERSION (Neon + bcrypt + Railway safe)
 
 const express = require("express");
 const cors = require("cors");
@@ -10,7 +10,7 @@ const morgan = require("morgan");
 const multer = require("multer");
 const fs = require("fs");
 const path = require("path");
-const crypto = require("crypto");
+const bcrypt = require("bcrypt");
 const { URL } = require("url");
 require("dotenv").config();
 
@@ -28,30 +28,14 @@ const reportsRoutes = require("./routes/reports.routes");
 const app = express();
 
 /**
- * IMPORTANT:
- * Railway + Cloudflare require trust proxy = 1
- * NOT true
+ * REQUIRED for Railway + Cloudflare
+ * (fixes express-rate-limit warning)
  */
 app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY || "";
-const RAW_DATABASE_URL = process.env.DATABASE_URL || "";
-
-/* ===========================
-   ADMIN AUTH CONFIG
-=========================== */
-const ADMIN_SECRET =
-  process.env.ADMIN_SECRET ||
-  process.env.ADMIN_JWT_SECRET ||
-  "";
-
-function hashPassword(password) {
-  return crypto
-    .createHash("sha256")
-    .update(password + ADMIN_SECRET)
-    .digest("hex");
-}
+const DATABASE_URL = process.env.DATABASE_URL || "";
 
 /* ===========================
    MIDDLEWARE
@@ -82,9 +66,10 @@ app.use("/channels", channelRoutes);
 app.use("/reports", reportsRoutes);
 
 /* ===========================
-   DB INIT (SUPABASE / NEON SAFE)
+   DATABASE (NEON DIRECT)
 =========================== */
 let pool = null;
+
 const db = {
   query: (q, p) => {
     if (!pool) throw new Error("DB not ready");
@@ -93,28 +78,23 @@ const db = {
 };
 
 (async function initDB() {
-  if (!RAW_DATABASE_URL) {
-    console.warn("⚠️ DATABASE_URL not set");
+  if (!DATABASE_URL) {
+    console.error("❌ DATABASE_URL not set");
     return;
   }
 
-  // 🔍 THIS IS THE IMPORTANT LINE
-  console.log(
-    "🔎 DATABASE_URL HOST:",
-    new URL(RAW_DATABASE_URL).host
-  );
+  // 🔎 Log host once (helps confirm NOT pooler)
+  console.log("🔎 DATABASE_URL HOST:", new URL(DATABASE_URL).host);
 
   const { Pool } = require("pg");
+  pool = new Pool({ connectionString: DATABASE_URL });
 
-  pool = new Pool({
-    connectionString: RAW_DATABASE_URL
-  });
-
-  console.log("✅ Database pool initialized");
+  await pool.query("select 1");
+  console.log("✅ Connected to Neon PostgreSQL");
 })();
 
 /* ===========================
-   ADMIN LOGIN (USERNAME BASED)
+   ADMIN LOGIN (bcrypt-based)
 =========================== */
 app.post("/admin/auth/login", async (req, res) => {
   try {
@@ -127,20 +107,26 @@ app.post("/admin/auth/login", async (req, res) => {
       });
     }
 
-    const passwordHash = hashPassword(password);
-
     const result = await db.query(
-      `SELECT id, username, role
+      `SELECT id, username, role, password_hash
        FROM admins
        WHERE username = $1
-         AND password_hash = $2
        LIMIT 1`,
-      [username, passwordHash]
+      [username]
     );
 
     const admin = result.rows[0];
 
     if (!admin) {
+      return res.status(401).json({
+        error: "invalid_credentials",
+        message: "Invalid username or password"
+      });
+    }
+
+    const isValid = await bcrypt.compare(password, admin.password_hash);
+
+    if (!isValid) {
       return res.status(401).json({
         error: "invalid_credentials",
         message: "Invalid username or password"
@@ -188,8 +174,6 @@ app.post("/chat", async (req, res) => {
     if (!site) {
       return res.status(403).json({ error: "site_not_registered" });
     }
-
-    const sessionId = req.body.sessionId || `anon-${Date.now()}`;
 
     const aiResp = await axios.post(
       "https://api.openai.com/v1/chat/completions",
