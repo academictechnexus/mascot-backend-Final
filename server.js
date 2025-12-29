@@ -17,7 +17,7 @@ const { URL } = require("url");
 require("dotenv").config();
 
 /* ===========================
-   NEW: workflows & routes
+   WORKFLOWS & ROUTES
 =========================== */
 const chatWorkflow = require("./workflows/chat.workflow");
 const onboardingRoutes = require("./routes/onboarding.routes");
@@ -25,15 +25,20 @@ const channelRoutes = require("./routes/channel.routes");
 const reportsRoutes = require("./routes/reports.routes");
 
 /* ===========================
-   Optional libs
+   OPTIONAL LIBS
 =========================== */
 let nodemailer = null;
-try { nodemailer = require("nodemailer"); } catch (e) {}
+try {
+  nodemailer = require("nodemailer");
+} catch (e) {}
 
 let stripe = null;
 if (process.env.STRIPE_SECRET_KEY) {
-  try { stripe = require("stripe")(process.env.STRIPE_SECRET_KEY); }
-  catch (e) { stripe = null; }
+  try {
+    stripe = require("stripe")(process.env.STRIPE_SECRET_KEY);
+  } catch (e) {
+    stripe = null;
+  }
 }
 
 const app = express();
@@ -46,7 +51,19 @@ const DEMO_DAYS = parseInt(process.env.DEMO_DAYS || "7", 10);
 const RECAPTCHA_SECRET = process.env.RECAPTCHA_SECRET || null;
 
 /* ===========================
-   Email config
+   ADMIN AUTH CONFIG (NEW)
+=========================== */
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "";
+
+function hashPassword(password) {
+  return crypto
+    .createHash("sha256")
+    .update(password + ADMIN_SECRET)
+    .digest("hex");
+}
+
+/* ===========================
+   EMAIL CONFIG
 =========================== */
 const SMTP_ENABLED = !!(
   process.env.SMTP_HOST &&
@@ -72,11 +89,12 @@ if (SMTP_ENABLED && nodemailer) {
 }
 
 /* ===========================
-   Middleware
+   MIDDLEWARE
 =========================== */
 app.use(express.json({ limit: "1mb" }));
 app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(helmet({ contentSecurityPolicy: false }));
+
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
 app.use(morgan(":reqid :method :url :status :response-time ms"));
 
@@ -90,16 +108,17 @@ const limiter = rateLimit({
 app.use("/chat", limiter);
 app.use("/site/request-demo", limiter);
 app.use("/mascot/upload", limiter);
+app.use("/admin/auth/login", limiter);
 
 /* ===========================
-   NEW ROUTES (SAFE)
+   ROUTES
 =========================== */
 app.use("/onboarding", onboardingRoutes);
 app.use("/channels", channelRoutes);
 app.use("/reports", reportsRoutes);
 
 /* ===========================
-   Plans
+   PLANS
 =========================== */
 const PLAN_CONFIG = {
   basic: { dailyQuota: 50 },
@@ -108,7 +127,7 @@ const PLAN_CONFIG = {
 };
 
 /* ===========================
-   DB INIT (UNCHANGED)
+   DB INIT
 =========================== */
 let pool = null;
 const db = {
@@ -133,8 +152,56 @@ function buildNeonConnectionString(raw) {
     ssl: { rejectUnauthorized: false }
   });
 })();
+
 /* ===========================
-   CHAT ENDPOINT (SAFE ENHANCED)
+   ADMIN LOGIN (NEW)
+=========================== */
+app.post("/admin/auth/login", async (req, res) => {
+  try {
+    const { email, password } = req.body || {};
+
+    if (!email || !password) {
+      return res.status(400).json({
+        error: "missing_credentials",
+        message: "Email and password are required"
+      });
+    }
+
+    const passwordHash = hashPassword(password);
+
+    const result = await db.query(
+      `SELECT id, email, is_active
+       FROM admins
+       WHERE email = $1
+         AND password_hash = $2
+       LIMIT 1`,
+      [email.toLowerCase(), passwordHash]
+    );
+
+    const admin = result.rows[0];
+
+    if (!admin || !admin.is_active) {
+      return res.status(401).json({
+        error: "invalid_credentials",
+        message: "Invalid email or password"
+      });
+    }
+
+    return res.json({
+      success: true,
+      admin: {
+        id: admin.id,
+        email: admin.email
+      }
+    });
+  } catch (err) {
+    console.error("Admin login error", err);
+    return res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ===========================
+   CHAT ENDPOINT
 =========================== */
 app.post("/chat", async (req, res) => {
   try {
@@ -156,13 +223,13 @@ app.post("/chat", async (req, res) => {
       [siteDomain]
     );
     const site = siteRes.rows[0];
+
     if (!site) {
       return res.status(403).json({ error: "site_not_registered" });
     }
 
     const sessionId = req.body.sessionId || `anon-${Date.now()}`;
 
-    /* --------- EXISTING AI LOGIC (UNCHANGED) --------- */
     const messages = [
       { role: "system", content: "You are a helpful website assistant." },
       { role: "user", content: userMessage }
@@ -187,7 +254,6 @@ app.post("/chat", async (req, res) => {
     const aiReply =
       aiResp.data?.choices?.[0]?.message?.content || "";
 
-    /* --------- NEW: CHAT WORKFLOW (NON-BREAKING) --------- */
     let finalReply = aiReply;
     let ticketId = null;
 
@@ -224,6 +290,7 @@ app.post("/chat", async (req, res) => {
     return res.status(500).json({ error: "server_error" });
   }
 });
+
 /* ===========================
    UPLOADS
 =========================== */
