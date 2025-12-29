@@ -1,4 +1,6 @@
+ARG CACHE_BUST=1
 FROM node:20-alpine
+
 WORKDIR /app
 
 # Install deps with or without a lockfile
