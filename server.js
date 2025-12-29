@@ -98,10 +98,14 @@ const db = {
     return;
   }
 
+  // 🔍 THIS IS THE IMPORTANT LINE
+  console.log(
+    "🔎 DATABASE_URL HOST:",
+    new URL(RAW_DATABASE_URL).host
+  );
+
   const { Pool } = require("pg");
 
-  // 🔴 CRITICAL FIX:
-  // Do NOT override SSL or mutate URL for Supabase pooler
   pool = new Pool({
     connectionString: RAW_DATABASE_URL
   });
