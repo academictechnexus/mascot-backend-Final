@@ -195,11 +195,69 @@ app.put("/admin/settings", adminAuth, async (req, res) => {
   }
 });
 
+/* ================= SITE MANAGEMENT (NEW – REQUIRED) ================= */
+
+// Create site
+app.post("/admin/sites", adminAuth, async (req, res) => {
+  try {
+    const { domain, plan, daily_quota, status } = req.body;
+
+    if (!domain || !plan) {
+      return res.status(400).json({ error: "missing_fields" });
+    }
+
+    const result = await db.query(
+      `
+      INSERT INTO sites (domain, plan, daily_quota, status)
+      VALUES ($1,$2,$3,$4)
+      RETURNING *
+      `,
+      [
+        domain.toLowerCase().trim(),
+        plan,
+        Number(daily_quota) || 0,
+        status || "active"
+      ]
+    );
+
+    res.json({ success: true, site: result.rows[0] });
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(400).json({ error: "site_already_exists" });
+    }
+    console.error("Create site error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Update site (plan / quota / status)
+app.put("/admin/sites/:id", adminAuth, async (req, res) => {
+  try {
+    const { plan, daily_quota, status } = req.body;
+
+    await db.query(
+      `
+      UPDATE sites
+      SET plan=$1,
+          daily_quota=$2,
+          status=$3
+      WHERE id=$4
+      `,
+      [plan, Number(daily_quota), status, req.params.id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Update site error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
 /* ================= PER-SITE AI SETTINGS ================= */
 
 app.get("/admin/sites", adminAuth, async (_, res) => {
   const { rows } = await db.query(
-    "SELECT id, domain, plan, status FROM sites ORDER BY domain"
+    "SELECT id, domain, plan, daily_quota, status FROM sites ORDER BY domain"
   );
   res.json(rows);
 });
