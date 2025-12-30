@@ -1,6 +1,6 @@
 // server.js
-// Mascot backend — FINAL WORKING VERSION
-// Railway + Cloudflare Pages + Neon + JWT SAFE
+// Mascot backend — SECURED VERSION
+// Railway + Cloudflare Pages + Neon + JWT VERIFIED
 
 const express = require("express");
 const cors = require("cors");
@@ -16,6 +16,8 @@ const jwt = require("jsonwebtoken");
 const { URL } = require("url");
 require("dotenv").config();
 
+const adminAuth = require("./middleware/adminAuth");
+
 /* ===========================
    APP SETUP
 =========================== */
@@ -28,22 +30,18 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 const JWT_SECRET = process.env.ADMIN_JWT_SECRET;
 
 /* ===========================
-   🔴 CORS — FINAL FIX
-   (allow Cloudflare Pages preview URLs)
+   CORS (Cloudflare Safe)
 =========================== */
 app.use(
   cors({
-    origin: true, // ✅ allow all origins (safe for now)
+    origin: true,
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true
   })
 );
 
-// ✅ Explicit preflight handling (CRITICAL)
-app.options("*", (req, res) => {
-  res.sendStatus(204);
-});
+app.options("*", (_, res) => res.sendStatus(204));
 
 /* ===========================
    MIDDLEWARE
@@ -55,8 +53,7 @@ morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
 app.use(morgan(":reqid :method :url :status :response-time ms"));
 
 /* ===========================
-   RATE LIMITER
-   (DO NOT apply to login)
+   RATE LIMITING
 =========================== */
 const limiter = rateLimit({
   windowMs: 10_000,
@@ -96,8 +93,7 @@ const db = {
 })();
 
 /* ===========================
-   ADMIN LOGIN (JWT)
-   ⚠️ NOT rate-limited
+   ADMIN AUTH (PUBLIC)
 =========================== */
 app.post("/admin/auth/login", async (req, res) => {
   try {
@@ -121,16 +117,14 @@ app.post("/admin/auth/login", async (req, res) => {
     const admin = result.rows[0];
     if (!admin) {
       return res.status(401).json({
-        error: "invalid_credentials",
-        message: "Invalid username or password"
+        error: "invalid_credentials"
       });
     }
 
     const valid = await bcrypt.compare(password, admin.password_hash);
     if (!valid) {
       return res.status(401).json({
-        error: "invalid_credentials",
-        message: "Invalid username or password"
+        error: "invalid_credentials"
       });
     }
 
@@ -144,7 +138,7 @@ app.post("/admin/auth/login", async (req, res) => {
       { expiresIn: "12h" }
     );
 
-    return res.json({
+    res.json({
       success: true,
       token,
       admin: {
@@ -155,8 +149,18 @@ app.post("/admin/auth/login", async (req, res) => {
     });
   } catch (err) {
     console.error("Admin login error:", err);
-    return res.status(500).json({ error: "server_error" });
+    res.status(500).json({ error: "server_error" });
   }
+});
+
+/* ===========================
+   ADMIN (PROTECTED)
+=========================== */
+app.get("/admin/me", adminAuth, (req, res) => {
+  res.json({
+    success: true,
+    admin: req.admin
+  });
 });
 
 /* ===========================
