@@ -1,5 +1,5 @@
 // server.js
-// Mascot backend — SECURED VERSION
+// Mascot backend — FULL ADMIN CONTROL ENABLED
 // Railway + Cloudflare Pages + Neon + JWT VERIFIED
 
 const express = require("express");
@@ -35,7 +35,7 @@ const JWT_SECRET = process.env.ADMIN_JWT_SECRET;
 app.use(
   cors({
     origin: true,
-    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true
   })
@@ -93,6 +93,14 @@ const db = {
 })();
 
 /* ===========================
+   MAKE DB AVAILABLE TO ROUTES
+=========================== */
+app.use((req, res, next) => {
+  req.db = db;
+  next();
+});
+
+/* ===========================
    ADMIN AUTH (PUBLIC)
 =========================== */
 app.post("/admin/auth/login", async (req, res) => {
@@ -116,16 +124,12 @@ app.post("/admin/auth/login", async (req, res) => {
 
     const admin = result.rows[0];
     if (!admin) {
-      return res.status(401).json({
-        error: "invalid_credentials"
-      });
+      return res.status(401).json({ error: "invalid_credentials" });
     }
 
     const valid = await bcrypt.compare(password, admin.password_hash);
     if (!valid) {
-      return res.status(401).json({
-        error: "invalid_credentials"
-      });
+      return res.status(401).json({ error: "invalid_credentials" });
     }
 
     const token = jwt.sign(
@@ -154,13 +158,120 @@ app.post("/admin/auth/login", async (req, res) => {
 });
 
 /* ===========================
-   ADMIN (PROTECTED)
+   ADMIN SESSION CHECK
 =========================== */
 app.get("/admin/me", adminAuth, (req, res) => {
   res.json({
     success: true,
     admin: req.admin
   });
+});
+
+/* ===========================
+   ADMIN SITES MANAGEMENT (FULL CONTROL)
+=========================== */
+
+// Get all sites
+app.get("/admin/sites", adminAuth, async (req, res) => {
+  try {
+    const { rows } = await req.db.query(
+      `SELECT id, name, domain, plan, daily_quota, status, created_at
+       FROM sites
+       ORDER BY created_at DESC`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("GET sites error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Create site
+app.post("/admin/sites", adminAuth, async (req, res) => {
+  try {
+    const { name, domain, plan = "basic", daily_quota = 50, status = "active" } =
+      req.body;
+
+    if (!name || !domain) {
+      return res.status(400).json({
+        error: "missing_fields",
+        message: "Name and domain are required"
+      });
+    }
+
+    const { rows } = await req.db.query(
+      `INSERT INTO sites (name, domain, plan, daily_quota, status)
+       VALUES ($1, $2, $3, $4, $5)
+       RETURNING *`,
+      [name, domain, plan, daily_quota, status]
+    );
+
+    res.status(201).json(rows[0]);
+  } catch (err) {
+    if (err.code === "23505") {
+      return res.status(409).json({
+        error: "duplicate_domain",
+        message: "Domain already exists"
+      });
+    }
+
+    console.error("CREATE site error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Update site (plan / quota / name)
+app.put("/admin/sites/:id", adminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { name, plan, daily_quota } = req.body;
+
+    const { rows } = await req.db.query(
+      `UPDATE sites
+       SET
+         name = COALESCE($1, name),
+         plan = COALESCE($2, plan),
+         daily_quota = COALESCE($3, daily_quota)
+       WHERE id = $4
+       RETURNING *`,
+      [name, plan, daily_quota, id]
+    );
+
+    if (!rows[0]) {
+      return res.status(404).json({ error: "site_not_found" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("UPDATE site error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Enable / Disable site
+app.patch("/admin/sites/:id/status", adminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!["active", "demo", "disabled"].includes(status)) {
+      return res.status(400).json({ error: "invalid_status" });
+    }
+
+    const { rows } = await req.db.query(
+      `UPDATE sites SET status = $1 WHERE id = $2 RETURNING *`,
+      [status, id]
+    );
+
+    if (!rows[0]) {
+      return res.status(404).json({ error: "site_not_found" });
+    }
+
+    res.json(rows[0]);
+  } catch (err) {
+    console.error("UPDATE status error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
 });
 
 /* ===========================
