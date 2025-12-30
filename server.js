@@ -1,6 +1,6 @@
 // server.js
-// Mascot backend — FINAL PRODUCTION VERSION
-// Neon + bcrypt + JWT + Railway safe
+// Mascot backend — FINAL FIXED PRODUCTION VERSION
+// Neon + bcrypt + JWT + Railway + Cloudflare safe
 
 const express = require("express");
 const cors = require("cors");
@@ -17,9 +17,8 @@ const { URL } = require("url");
 require("dotenv").config();
 
 /* ===========================
-   WORKFLOWS & ROUTES
+   ROUTES
 =========================== */
-const chatWorkflow = require("./workflows/chat.workflow");
 const onboardingRoutes = require("./routes/onboarding.routes");
 const channelRoutes = require("./routes/channel.routes");
 const reportsRoutes = require("./routes/reports.routes");
@@ -28,8 +27,6 @@ const reportsRoutes = require("./routes/reports.routes");
    APP SETUP
 =========================== */
 const app = express();
-
-// Required for Railway + Cloudflare + rate-limit
 app.set("trust proxy", 1);
 
 const PORT = process.env.PORT || 3000;
@@ -38,10 +35,34 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 const JWT_SECRET = process.env.ADMIN_JWT_SECRET;
 
 /* ===========================
+   CORS (CRITICAL FIX)
+=========================== */
+const allowedOrigins = [
+  "https://f9f0626z.mascot-admin-ui.pages.dev",
+  "https://mascot-admin-ui.pages.dev",
+  "https://mascot.academictechnexus.com"
+];
+
+app.use(
+  cors({
+    origin(origin, cb) {
+      if (!origin) return cb(null, true); // curl / server calls
+      if (allowedOrigins.includes(origin)) return cb(null, true);
+      return cb(new Error("Not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+    credentials: true
+  })
+);
+
+// Explicit preflight handling
+app.options("*", cors());
+
+/* ===========================
    MIDDLEWARE
 =========================== */
 app.use(express.json({ limit: "1mb" }));
-app.use(cors({ origin: "*", methods: ["GET", "POST", "OPTIONS"] }));
 app.use(helmet({ contentSecurityPolicy: false }));
 
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
@@ -66,7 +87,7 @@ app.use("/channels", channelRoutes);
 app.use("/reports", reportsRoutes);
 
 /* ===========================
-   DATABASE (NEON DIRECT)
+   DATABASE (NEON)
 =========================== */
 let pool = null;
 
@@ -93,7 +114,7 @@ const db = {
 })();
 
 /* ===========================
-   ADMIN LOGIN (JWT + bcrypt)
+   ADMIN LOGIN
 =========================== */
 app.post("/admin/auth/login", async (req, res) => {
   try {
@@ -115,7 +136,6 @@ app.post("/admin/auth/login", async (req, res) => {
     );
 
     const admin = result.rows[0];
-
     if (!admin) {
       return res.status(401).json({
         error: "invalid_credentials",
@@ -124,7 +144,6 @@ app.post("/admin/auth/login", async (req, res) => {
     }
 
     const valid = await bcrypt.compare(password, admin.password_hash);
-
     if (!valid) {
       return res.status(401).json({
         error: "invalid_credentials",
@@ -133,11 +152,7 @@ app.post("/admin/auth/login", async (req, res) => {
     }
 
     const token = jwt.sign(
-      {
-        id: admin.id,
-        username: admin.username,
-        role: admin.role
-      },
+      { id: admin.id, username: admin.username, role: admin.role },
       JWT_SECRET,
       { expiresIn: "12h" }
     );
@@ -152,13 +167,13 @@ app.post("/admin/auth/login", async (req, res) => {
       }
     });
   } catch (err) {
-    console.error("Admin login error:", err.message);
+    console.error("Admin login error:", err);
     return res.status(500).json({ error: "server_error" });
   }
 });
 
 /* ===========================
-   CHAT ENDPOINT (UNCHANGED)
+   CHAT
 =========================== */
 app.post("/chat", async (req, res) => {
   try {
@@ -179,9 +194,8 @@ app.post("/chat", async (req, res) => {
       "SELECT * FROM sites WHERE domain = $1",
       [siteDomain]
     );
-    const site = siteRes.rows[0];
 
-    if (!site) {
+    if (!siteRes.rows[0]) {
       return res.status(403).json({ error: "site_not_registered" });
     }
 
@@ -204,12 +218,12 @@ app.post("/chat", async (req, res) => {
       }
     );
 
-    return res.json({
+    res.json({
       reply: aiResp.data?.choices?.[0]?.message?.content || ""
     });
   } catch (err) {
-    console.error("Chat error:", err.message);
-    return res.status(500).json({ error: "server_error" });
+    console.error("Chat error:", err);
+    res.status(500).json({ error: "server_error" });
   }
 });
 
@@ -237,7 +251,7 @@ app.get("/health", (_, res) =>
 );
 
 /* ===========================
-   START SERVER
+   START
 =========================== */
 app.listen(PORT, () => {
   console.log(`✅ Mascot backend running on port ${PORT}`);
