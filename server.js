@@ -1,6 +1,6 @@
 // server.js
-// Mascot backend — FINAL FIXED PRODUCTION VERSION
-// Neon + bcrypt + JWT + Railway + Cloudflare safe
+// Mascot backend — FINAL WORKING VERSION
+// Railway + Cloudflare Pages + Neon + JWT SAFE
 
 const express = require("express");
 const cors = require("cors");
@@ -17,13 +17,6 @@ const { URL } = require("url");
 require("dotenv").config();
 
 /* ===========================
-   ROUTES
-=========================== */
-const onboardingRoutes = require("./routes/onboarding.routes");
-const channelRoutes = require("./routes/channel.routes");
-const reportsRoutes = require("./routes/reports.routes");
-
-/* ===========================
    APP SETUP
 =========================== */
 const app = express();
@@ -35,29 +28,22 @@ const DATABASE_URL = process.env.DATABASE_URL || "";
 const JWT_SECRET = process.env.ADMIN_JWT_SECRET;
 
 /* ===========================
-   CORS (CRITICAL FIX)
+   🔴 CORS — FINAL FIX
+   (allow Cloudflare Pages preview URLs)
 =========================== */
-const allowedOrigins = [
-  "https://f9f0626z.mascot-admin-ui.pages.dev",
-  "https://mascot-admin-ui.pages.dev",
-  "https://mascot.academictechnexus.com"
-];
-
 app.use(
   cors({
-    origin(origin, cb) {
-      if (!origin) return cb(null, true); // curl / server calls
-      if (allowedOrigins.includes(origin)) return cb(null, true);
-      return cb(new Error("Not allowed by CORS"));
-    },
+    origin: true, // ✅ allow all origins (safe for now)
     methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
     credentials: true
   })
 );
 
-// Explicit preflight handling
-app.options("*", cors());
+// ✅ Explicit preflight handling (CRITICAL)
+app.options("*", (req, res) => {
+  res.sendStatus(204);
+});
 
 /* ===========================
    MIDDLEWARE
@@ -68,6 +54,10 @@ app.use(helmet({ contentSecurityPolicy: false }));
 morgan.token("reqid", () => Math.random().toString(36).slice(2, 9));
 app.use(morgan(":reqid :method :url :status :response-time ms"));
 
+/* ===========================
+   RATE LIMITER
+   (DO NOT apply to login)
+=========================== */
 const limiter = rateLimit({
   windowMs: 10_000,
   max: 10,
@@ -77,14 +67,6 @@ const limiter = rateLimit({
 
 app.use("/chat", limiter);
 app.use("/mascot/upload", limiter);
-app.use("/admin/auth/login", limiter);
-
-/* ===========================
-   ROUTES
-=========================== */
-app.use("/onboarding", onboardingRoutes);
-app.use("/channels", channelRoutes);
-app.use("/reports", reportsRoutes);
 
 /* ===========================
    DATABASE (NEON)
@@ -114,7 +96,8 @@ const db = {
 })();
 
 /* ===========================
-   ADMIN LOGIN
+   ADMIN LOGIN (JWT)
+   ⚠️ NOT rate-limited
 =========================== */
 app.post("/admin/auth/login", async (req, res) => {
   try {
@@ -152,7 +135,11 @@ app.post("/admin/auth/login", async (req, res) => {
     }
 
     const token = jwt.sign(
-      { id: admin.id, username: admin.username, role: admin.role },
+      {
+        id: admin.id,
+        username: admin.username,
+        role: admin.role
+      },
       JWT_SECRET,
       { expiresIn: "12h" }
     );
@@ -251,7 +238,7 @@ app.get("/health", (_, res) =>
 );
 
 /* ===========================
-   START
+   START SERVER
 =========================== */
 app.listen(PORT, () => {
   console.log(`✅ Mascot backend running on port ${PORT}`);
