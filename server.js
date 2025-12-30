@@ -30,10 +30,7 @@ app.use(express.json({ limit: "1mb" }));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan("dev"));
 
-app.use(
-  "/chat",
-  rateLimit({ windowMs: 10_000, max: 10 })
-);
+app.use("/chat", rateLimit({ windowMs: 10_000, max: 10 }));
 
 /* ================= DATABASE ================= */
 const pool = new Pool({ connectionString: DATABASE_URL });
@@ -83,7 +80,6 @@ app.get("/admin/me", adminAuth, (req, res) => {
 
 /* ================= ADMIN ANALYTICS ================= */
 
-// Overview KPIs
 app.get("/admin/analytics/overview", adminAuth, async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -114,12 +110,11 @@ app.get("/admin/analytics/overview", adminAuth, async (req, res) => {
       knowledgeItems: Number(knowledgeItems)
     });
   } catch (err) {
-    console.error("Analytics overview error:", err);
+    console.error(err);
     res.status(500).json({ error: "server_error" });
   }
 });
 
-// Per-site usage today
 app.get("/admin/analytics/sites", adminAuth, async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
@@ -143,12 +138,177 @@ app.get("/admin/analytics/sites", adminAuth, async (req, res) => {
 
     res.json(rows);
   } catch (err) {
-    console.error("Analytics sites error:", err);
+    console.error(err);
     res.status(500).json({ error: "server_error" });
   }
 });
 
-/* ================= CHAT (CORE ENGINE) ================= */
+/* ================= GLOBAL SETTINGS ================= */
+
+app.get("/admin/settings", adminAuth, async (_, res) => {
+  const { rows } = await db.query("SELECT * FROM global_settings LIMIT 1");
+  res.json(rows[0]);
+});
+
+app.put("/admin/settings", adminAuth, async (req, res) => {
+  try {
+    const allowed = [
+      "demo_days",
+      "demo_daily_quota",
+      "ai_enabled",
+      "learning_enabled",
+      "tone",
+      "temperature",
+      "max_tokens",
+      "system_prompt",
+      "blocked_topics"
+    ];
+
+    const fields = [];
+    const values = [];
+    let i = 1;
+
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        fields.push(`${key}=$${i++}`);
+        values.push(req.body[key]);
+      }
+    }
+
+    if (!fields.length) {
+      return res.status(400).json({ error: "no_valid_fields" });
+    }
+
+    values.push(true);
+
+    await db.query(
+      `UPDATE global_settings
+       SET ${fields.join(", ")}, updated_at=NOW()
+       WHERE id=$${i}`,
+      values
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ================= PER-SITE AI SETTINGS ================= */
+
+app.get("/admin/sites", adminAuth, async (_, res) => {
+  const { rows } = await db.query(
+    "SELECT id, domain, plan, status FROM sites ORDER BY domain"
+  );
+  res.json(rows);
+});
+
+app.get("/admin/sites/:id/ai", adminAuth, async (req, res) => {
+  const { rows } = await db.query(
+    "SELECT * FROM site_ai_settings WHERE site_id=$1",
+    [req.params.id]
+  );
+  res.json(rows[0] || {});
+});
+
+app.put("/admin/sites/:id/ai", adminAuth, async (req, res) => {
+  try {
+    const allowed = [
+      "ai_enabled",
+      "learning_enabled",
+      "temperature",
+      "max_tokens",
+      "system_prompt",
+      "blocked_topics"
+    ];
+
+    const fields = [];
+    const values = [];
+    let i = 2;
+
+    for (const key of allowed) {
+      if (req.body[key] !== undefined) {
+        fields.push(`${key}=$${i++}`);
+        values.push(req.body[key]);
+      }
+    }
+
+    if (!fields.length) {
+      return res.status(400).json({ error: "no_valid_fields" });
+    }
+
+    await db.query(
+      `
+      INSERT INTO site_ai_settings (site_id, ${fields.map(f => f.split("=")[0]).join(", ")})
+      VALUES ($1, ${fields.map((_, idx) => `$${idx + 2}`).join(", ")})
+      ON CONFLICT (site_id)
+      DO UPDATE SET ${fields.join(", ")}
+      `,
+      [req.params.id, ...values]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+/* ================= CONVERSATIONS & KNOWLEDGE ================= */
+
+app.get("/admin/conversations", adminAuth, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+  const offset = Number(req.query.offset) || 0;
+
+  const { rows } = await db.query(
+    `
+    SELECT c.id, c.session_id, c.created_at, s.domain
+    FROM conversations c
+    JOIN sites s ON s.id=c.site_id
+    ORDER BY c.created_at DESC
+    LIMIT $1 OFFSET $2
+    `,
+    [limit, offset]
+  );
+
+  res.json(rows);
+});
+
+app.get("/admin/conversations/:id/messages", adminAuth, async (req, res) => {
+  const { rows } = await db.query(
+    `
+    SELECT role, text, created_at
+    FROM messages
+    WHERE conversation_id=$1
+    ORDER BY created_at ASC
+    `,
+    [req.params.id]
+  );
+
+  res.json(rows);
+});
+
+app.get("/admin/knowledge", adminAuth, async (req, res) => {
+  const limit = Math.min(Number(req.query.limit) || 50, 100);
+  const offset = Number(req.query.offset) || 0;
+
+  const { rows } = await db.query(
+    `
+    SELECT k.id, k.title, k.content, k.created_at, s.domain
+    FROM knowledge_items k
+    JOIN sites s ON s.id=k.site_id
+    ORDER BY k.created_at DESC
+    LIMIT $1 OFFSET $2
+    `,
+    [limit, offset]
+  );
+
+  res.json(rows);
+});
+
+/* ================= CHAT (CORE ENGINE — UNCHANGED) ================= */
+
 app.post("/chat", async (req, res) => {
   try {
     const userMessage = (req.body.message || "").trim();
@@ -164,7 +324,6 @@ app.post("/chat", async (req, res) => {
       return res.status(400).json({ error: "unknown_site" });
     }
 
-    /* -------- Site -------- */
     const siteRes = await db.query(
       "SELECT * FROM sites WHERE domain=$1",
       [siteDomain]
@@ -174,12 +333,10 @@ app.post("/chat", async (req, res) => {
       return res.status(403).json({ error: "site_not_registered" });
     }
 
-    /* -------- Global Settings -------- */
     const global = (
       await db.query("SELECT * FROM global_settings LIMIT 1")
     ).rows[0];
 
-    /* -------- Site AI Override -------- */
     const siteAI = (
       await db.query(
         "SELECT * FROM site_ai_settings WHERE site_id=$1",
@@ -209,7 +366,6 @@ app.post("/chat", async (req, res) => {
       return res.json({ reply: "I can’t help with this topic." });
     }
 
-    /* -------- Usage & Quota -------- */
     const today = new Date().toISOString().slice(0, 10);
 
     await db.query(
@@ -237,7 +393,6 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    /* -------- Conversation -------- */
     const sessionId = req.body.session || "anon";
 
     let convo = (
@@ -258,14 +413,12 @@ app.post("/chat", async (req, res) => {
       ).rows[0];
     }
 
-    /* -------- Store User Message -------- */
     await db.query(
       `INSERT INTO messages (conversation_id, role, text)
        VALUES ($1,'user',$2)`,
       [convo.id, userMessage]
     );
 
-    /* -------- OpenAI Call -------- */
     const aiResp = await axios.post(
       "https://api.openai.com/v1/chat/completions",
       {
@@ -288,14 +441,12 @@ app.post("/chat", async (req, res) => {
     const reply =
       aiResp.data?.choices?.[0]?.message?.content || "";
 
-    /* -------- Store AI Message -------- */
     await db.query(
       `INSERT INTO messages (conversation_id, role, text)
        VALUES ($1,'assistant',$2)`,
       [convo.id, reply]
     );
 
-    /* -------- Increment Usage -------- */
     await db.query(
       `UPDATE usage_daily
        SET count = count + 1
@@ -303,7 +454,6 @@ app.post("/chat", async (req, res) => {
       [site.id, today]
     );
 
-    /* -------- SAFE SELF-LEARNING -------- */
     if (ai.learning) {
       const msgCount = (
         await db.query(
