@@ -1,5 +1,5 @@
 // server.js
-// Mascot backend — FULL AI SAAS ENGINE (FINAL, SAFE, ENTERPRISE)
+// Mascot backend — FULL AI SAAS ENGINE (FINAL, SAFE, ENTERPRISE + ANALYTICS)
 
 const express = require("express");
 const cors = require("cors");
@@ -79,6 +79,73 @@ app.post("/admin/auth/login", async (req, res) => {
 /* ================= ADMIN SESSION ================= */
 app.get("/admin/me", adminAuth, (req, res) => {
   res.json({ success: true, admin: req.admin });
+});
+
+/* ================= ADMIN ANALYTICS ================= */
+
+// Overview KPIs
+app.get("/admin/analytics/overview", adminAuth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const [{ count: totalSites }] = (
+      await db.query("SELECT COUNT(*) FROM sites")
+    ).rows;
+
+    const [{ count: activeSites }] = (
+      await db.query("SELECT COUNT(*) FROM sites WHERE status='active'")
+    ).rows;
+
+    const [{ count: messagesToday }] = (
+      await db.query(
+        "SELECT COUNT(*) FROM messages WHERE created_at::date = $1",
+        [today]
+      )
+    ).rows;
+
+    const [{ count: knowledgeItems }] = (
+      await db.query("SELECT COUNT(*) FROM knowledge_items")
+    ).rows;
+
+    res.json({
+      totalSites: Number(totalSites),
+      activeSites: Number(activeSites),
+      messagesToday: Number(messagesToday),
+      knowledgeItems: Number(knowledgeItems)
+    });
+  } catch (err) {
+    console.error("Analytics overview error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// Per-site usage today
+app.get("/admin/analytics/sites", adminAuth, async (req, res) => {
+  try {
+    const today = new Date().toISOString().slice(0, 10);
+
+    const { rows } = await db.query(
+      `
+      SELECT
+        s.id,
+        s.domain,
+        s.plan,
+        s.daily_quota,
+        s.status,
+        COALESCE(u.count, 0) AS usage_today
+      FROM sites s
+      LEFT JOIN usage_daily u
+        ON u.site_id = s.id AND u.date = $1
+      ORDER BY usage_today DESC
+      `,
+      [today]
+    );
+
+    res.json(rows);
+  } catch (err) {
+    console.error("Analytics sites error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
 });
 
 /* ================= CHAT (CORE ENGINE) ================= */
