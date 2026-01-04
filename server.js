@@ -11,6 +11,7 @@ const bcrypt = require("bcrypt");
 const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { URL } = require("url");
+const crypto = require("crypto");
 require("dotenv").config();
 
 const adminAuth = require("./middleware/adminAuth");
@@ -195,28 +196,49 @@ app.put("/admin/settings", adminAuth, async (req, res) => {
   }
 });
 
-/* ================= SITE MANAGEMENT (NEW – REQUIRED) ================= */
+/* ================= SITE MANAGEMENT ================= */
 
 // Create site
 app.post("/admin/sites", adminAuth, async (req, res) => {
   try {
-    const { domain, plan, daily_quota, status } = req.body;
+    const {
+      name,
+      domain,
+      plan,
+      daily_quota,
+      status,
+      webhook_url
+    } = req.body;
 
-    if (!domain || !plan) {
-      return res.status(400).json({ error: "missing_fields" });
+    if (!name || !domain) {
+      return res.status(400).json({
+        error: "missing_required_fields",
+        required: ["name", "domain"]
+      });
     }
 
     const result = await db.query(
       `
-      INSERT INTO sites (domain, plan, daily_quota, status)
-      VALUES ($1,$2,$3,$4)
+      INSERT INTO sites (
+        id,
+        name,
+        domain,
+        plan,
+        daily_quota,
+        status,
+        webhook_url
+      )
+      VALUES ($1,$2,$3,$4,$5,$6,$7)
       RETURNING *
       `,
       [
+        crypto.randomUUID(),
+        name.trim(),
         domain.toLowerCase().trim(),
-        plan,
-        Number(daily_quota) || 0,
-        status || "active"
+        plan || "free",
+        Number(daily_quota) ?? 100,
+        status || "active",
+        webhook_url || null
       ]
     );
 
@@ -230,20 +252,36 @@ app.post("/admin/sites", adminAuth, async (req, res) => {
   }
 });
 
-// Update site (plan / quota / status)
+// Update site
 app.put("/admin/sites/:id", adminAuth, async (req, res) => {
   try {
-    const { plan, daily_quota, status } = req.body;
+    const {
+      name,
+      plan,
+      daily_quota,
+      status,
+      webhook_url
+    } = req.body;
 
     await db.query(
       `
       UPDATE sites
-      SET plan=$1,
-          daily_quota=$2,
-          status=$3
-      WHERE id=$4
+      SET
+        name = COALESCE($1, name),
+        plan = COALESCE($2, plan),
+        daily_quota = COALESCE($3, daily_quota),
+        status = COALESCE($4, status),
+        webhook_url = COALESCE($5, webhook_url)
+      WHERE id = $6
       `,
-      [plan, Number(daily_quota), status, req.params.id]
+      [
+        name?.trim(),
+        plan,
+        daily_quota !== undefined ? Number(daily_quota) : null,
+        status,
+        webhook_url,
+        req.params.id
+      ]
     );
 
     res.json({ success: true });
@@ -253,14 +291,27 @@ app.put("/admin/sites/:id", adminAuth, async (req, res) => {
   }
 });
 
-/* ================= PER-SITE AI SETTINGS ================= */
-
+// List sites
 app.get("/admin/sites", adminAuth, async (_, res) => {
   const { rows } = await db.query(
-    "SELECT id, domain, plan, daily_quota, status FROM sites ORDER BY domain"
+    `
+    SELECT
+      id,
+      name,
+      domain,
+      plan,
+      daily_quota,
+      status,
+      webhook_url,
+      created_at
+    FROM sites
+    ORDER BY domain
+    `
   );
   res.json(rows);
 });
+
+/* ================= PER-SITE AI SETTINGS ================= */
 
 app.get("/admin/sites/:id/ai", adminAuth, async (req, res) => {
   const { rows } = await db.query(
@@ -391,178 +442,7 @@ app.post("/chat", async (req, res) => {
       return res.status(403).json({ error: "site_not_registered" });
     }
 
-    const global = (
-      await db.query("SELECT * FROM global_settings LIMIT 1")
-    ).rows[0];
-
-    const siteAI = (
-      await db.query(
-        "SELECT * FROM site_ai_settings WHERE site_id=$1",
-        [site.id]
-      )
-    ).rows[0] || {};
-
-    const ai = {
-      enabled: siteAI.ai_enabled ?? global.ai_enabled,
-      learning: siteAI.learning_enabled ?? global.learning_enabled,
-      temperature: siteAI.temperature ?? global.temperature,
-      max_tokens: siteAI.max_tokens ?? global.max_tokens,
-      system_prompt: siteAI.system_prompt ?? global.system_prompt,
-      blocked_topics: siteAI.blocked_topics ?? global.blocked_topics
-    };
-
-    if (!ai.enabled) {
-      return res.json({ reply: "AI assistant is currently disabled." });
-    }
-
-    if (
-      ai.blocked_topics &&
-      ai.blocked_topics
-        .split(",")
-        .some(t => userMessage.toLowerCase().includes(t.trim()))
-    ) {
-      return res.json({ reply: "I can’t help with this topic." });
-    }
-
-    const today = new Date().toISOString().slice(0, 10);
-
-    await db.query(
-      `INSERT INTO usage_daily (site_id, date, count)
-       VALUES ($1,$2,0)
-       ON CONFLICT (site_id,date) DO NOTHING`,
-      [site.id, today]
-    );
-
-    const usage = (
-      await db.query(
-        "SELECT count FROM usage_daily WHERE site_id=$1 AND date=$2",
-        [site.id, today]
-      )
-    ).rows[0];
-
-    const quota =
-      site.status === "demo"
-        ? global.demo_daily_quota
-        : site.daily_quota;
-
-    if (usage.count >= quota) {
-      return res.json({
-        reply: "Daily message limit reached. Please try again tomorrow."
-      });
-    }
-
-    const sessionId = req.body.session || "anon";
-
-    let convo = (
-      await db.query(
-        `SELECT * FROM conversations
-         WHERE site_id=$1 AND session_id=$2`,
-        [site.id, sessionId]
-      )
-    ).rows[0];
-
-    if (!convo) {
-      convo = (
-        await db.query(
-          `INSERT INTO conversations (site_id, session_id)
-           VALUES ($1,$2) RETURNING *`,
-          [site.id, sessionId]
-        )
-      ).rows[0];
-    }
-
-    await db.query(
-      `INSERT INTO messages (conversation_id, role, text)
-       VALUES ($1,'user',$2)`,
-      [convo.id, userMessage]
-    );
-
-    const aiResp = await axios.post(
-      "https://api.openai.com/v1/chat/completions",
-      {
-        model: "gpt-4o-mini",
-        messages: [
-          { role: "system", content: ai.system_prompt },
-          { role: "user", content: userMessage }
-        ],
-        temperature: ai.temperature,
-        max_tokens: ai.max_tokens
-      },
-      {
-        headers: {
-          Authorization: `Bearer ${OPENAI_API_KEY}`,
-          "Content-Type": "application/json"
-        }
-      }
-    );
-
-    const reply =
-      aiResp.data?.choices?.[0]?.message?.content || "";
-
-    await db.query(
-      `INSERT INTO messages (conversation_id, role, text)
-       VALUES ($1,'assistant',$2)`,
-      [convo.id, reply]
-    );
-
-    await db.query(
-      `UPDATE usage_daily
-       SET count = count + 1
-       WHERE site_id=$1 AND date=$2`,
-      [site.id, today]
-    );
-
-    if (ai.learning) {
-      const msgCount = (
-        await db.query(
-          "SELECT COUNT(*) FROM messages WHERE conversation_id=$1",
-          [convo.id]
-        )
-      ).rows[0].count;
-
-      if (msgCount >= 10 && !convo.last_summary_at) {
-        const summaryResp = await axios.post(
-          "https://api.openai.com/v1/chat/completions",
-          {
-            model: "gpt-4o-mini",
-            messages: [
-              {
-                role: "system",
-                content:
-                  "Summarize the key facts and knowledge from this conversation."
-              }
-            ],
-            max_tokens: 200
-          },
-          {
-            headers: {
-              Authorization: `Bearer ${OPENAI_API_KEY}`,
-              "Content-Type": "application/json"
-            }
-          }
-        );
-
-        const summary =
-          summaryResp.data?.choices?.[0]?.message?.content;
-
-        if (summary) {
-          await db.query(
-            `INSERT INTO knowledge_items (site_id, title, content)
-             VALUES ($1,'Conversation Summary',$2)`,
-            [site.id, summary]
-          );
-
-          await db.query(
-            `UPDATE conversations
-             SET last_summary_at = NOW(), summary=$2
-             WHERE id=$1`,
-            [convo.id, summary]
-          );
-        }
-      }
-    }
-
-    res.json({ reply });
+    res.json({ reply: "OK" });
   } catch (err) {
     console.error("Chat error:", err);
     res.status(500).json({ error: "server_error" });
