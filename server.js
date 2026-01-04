@@ -198,22 +198,38 @@ app.put("/admin/settings", adminAuth, async (req, res) => {
 
 /* ================= SITE MANAGEMENT ================= */
 
-// Create site
+// Create site  ✅ OPTION-B COMPATIBILITY FIX (ONLY CHANGE HERE)
 app.post("/admin/sites", adminAuth, async (req, res) => {
   try {
     const {
       name,
+      siteName,
       domain,
+      url,
       plan,
       daily_quota,
       status,
       webhook_url
     } = req.body;
 
-    if (!name || !domain) {
+    let finalDomain = domain || url;
+    if (finalDomain) {
+      finalDomain = finalDomain
+        .replace(/^https?:\/\//, "")
+        .replace(/\/$/, "")
+        .toLowerCase()
+        .trim();
+    }
+
+    const finalName =
+      name ||
+      siteName ||
+      (finalDomain ? finalDomain.split(".")[0] : null);
+
+    if (!finalName || !finalDomain) {
       return res.status(400).json({
         error: "missing_required_fields",
-        required: ["name", "domain"]
+        required: ["domain"]
       });
     }
 
@@ -233,10 +249,10 @@ app.post("/admin/sites", adminAuth, async (req, res) => {
       `,
       [
         crypto.randomUUID(),
-        name.trim(),
-        domain.toLowerCase().trim(),
+        finalName.trim(),
+        finalDomain,
         plan || "free",
-        Number(daily_quota) ?? 100,
+        Number(daily_quota) || 100,
         status || "active",
         webhook_url || null
       ]
@@ -255,13 +271,7 @@ app.post("/admin/sites", adminAuth, async (req, res) => {
 // Update site
 app.put("/admin/sites/:id", adminAuth, async (req, res) => {
   try {
-    const {
-      name,
-      plan,
-      daily_quota,
-      status,
-      webhook_url
-    } = req.body;
+    const { name, plan, daily_quota, status, webhook_url } = req.body;
 
     await db.query(
       `
@@ -349,7 +359,9 @@ app.put("/admin/sites/:id/ai", adminAuth, async (req, res) => {
 
     await db.query(
       `
-      INSERT INTO site_ai_settings (site_id, ${fields.map(f => f.split("=")[0]).join(", ")})
+      INSERT INTO site_ai_settings (site_id, ${fields
+        .map(f => f.split("=")[0])
+        .join(", ")})
       VALUES ($1, ${fields.map((_, idx) => `$${idx + 2}`).join(", ")})
       ON CONFLICT (site_id)
       DO UPDATE SET ${fields.join(", ")}
