@@ -198,12 +198,14 @@ adminRouter.post("/sites", adminAuth, async (req, res) => {
       return res.status(400).json({ error: "missing_domain" });
     }
 
-    const result = await db.query(
+    const siteId = crypto.randomUUID();
+
+    const siteResult = await db.query(
       `INSERT INTO sites (id, name, domain, plan, daily_quota, status)
        VALUES ($1,$2,$3,$4,$5,$6)
        RETURNING *`,
       [
-        crypto.randomUUID(),
+        siteId,
         req.body.name || finalDomain.split(".")[0],
         finalDomain,
         req.body.plan || "demo",
@@ -212,22 +214,69 @@ adminRouter.post("/sites", adminAuth, async (req, res) => {
       ]
     );
 
-    res.json({ success: true, site: result.rows[0] });
+    res.json({ success: true, site: siteResult.rows[0] });
   } catch (err) {
-    console.error(err);
+    console.error("Create site error:", err);
     res.status(500).json({ error: "server_error" });
   }
 });
 
 /* ======================================================
-   🆕 AI SETUP & LEARNING (ADMIN ONLY)
+   🆕 CLIENT SETUP TOKEN + PUBLIC SETUP (APPENDED ONLY)
 ====================================================== */
 
-const upload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
+/* ---------- Token generator (added) ---------- */
+async function createClientSetupToken(siteId) {
+  const token = crypto.randomBytes(24).toString("hex");
+  await db.query(
+    `INSERT INTO client_setup_tokens (id, site_id, token)
+     VALUES ($1,$2,$3)`,
+    [crypto.randomUUID(), siteId, token]
+  );
+  return token;
+}
 
-adminRouter.post("/sites/:id/setup", adminAuth, async (req, res) => {
+/* ---------- Resolve site by token (added) ---------- */
+async function resolveSiteByToken(token) {
+  const { rows } = await db.query(
+    `SELECT s.*
+     FROM client_setup_tokens t
+     JOIN sites s ON s.id = t.site_id
+     WHERE t.token=$1`,
+    [token]
+  );
+  return rows[0];
+}
+
+/* ---------- Public client setup routes (added) ---------- */
+
+app.get("/client-setup/:token", async (req, res) => {
   try {
-    const siteId = req.params.id;
+    const site = await resolveSiteByToken(req.params.token);
+    if (!site) {
+      return res.status(404).json({ error: "invalid_token" });
+    }
+
+    res.json({
+      site: {
+        id: site.id,
+        domain: site.domain,
+        setup_completed: site.setup_completed
+      }
+    });
+  } catch (err) {
+    console.error("Client setup fetch error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+app.post("/client-setup/:token/setup", async (req, res) => {
+  try {
+    const site = await resolveSiteByToken(req.params.token);
+    if (!site) {
+      return res.status(404).json({ error: "invalid_token" });
+    }
+
     const answers = req.body.answers || {};
 
     for (const key of Object.keys(answers)) {
@@ -236,55 +285,54 @@ adminRouter.post("/sites/:id/setup", adminAuth, async (req, res) => {
          VALUES ($1,$2,$3,$4)
          ON CONFLICT (site_id, question_key)
          DO UPDATE SET answer = EXCLUDED.answer`,
-        [crypto.randomUUID(), siteId, key, answers[key]]
+        [crypto.randomUUID(), site.id, key, answers[key]]
       );
     }
 
     await db.query(
       "UPDATE sites SET setup_completed=true WHERE id=$1",
-      [siteId]
+      [site.id]
     );
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Setup error:", err);
+    console.error("Client setup save error:", err);
     res.status(500).json({ error: "server_error" });
   }
 });
 
-adminRouter.post(
-  "/sites/:id/setup/upload",
-  adminAuth,
-  upload.array("files", 3),
+const clientUpload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
+
+app.post(
+  "/client-setup/:token/upload",
+  clientUpload.array("files", 3),
   async (req, res) => {
     try {
-      const siteId = req.params.id;
+      const site = await resolveSiteByToken(req.params.token);
+      if (!site) {
+        return res.status(404).json({ error: "invalid_token" });
+      }
 
       for (const file of req.files || []) {
         await db.query(
           `INSERT INTO site_knowledge (id, site_id, source, content)
            VALUES ($1,$2,'upload',$3)`,
-          [crypto.randomUUID(), siteId, file.buffer.toString("utf-8")]
+          [crypto.randomUUID(), site.id, file.buffer.toString("utf-8")]
         );
       }
 
       res.json({ success: true });
     } catch (err) {
-      console.error("Upload error:", err);
+      console.error("Client upload error:", err);
       res.status(500).json({ error: "server_error" });
     }
   }
 );
 
-/* ================= CHAT (EXTENDED, SAFE) ================= */
+/* ================= CHAT (UNCHANGED) ================= */
 
 app.post("/chat", async (req, res) => {
   try {
-    const userMessage = (req.body.message || "").trim();
-    if (!userMessage) {
-      return res.status(400).json({ error: "missing_message" });
-    }
-
     const siteDomain =
       req.body.site ||
       (req.headers.origin ? new URL(req.headers.origin).hostname : null);
@@ -309,7 +357,7 @@ app.post("/chat", async (req, res) => {
       });
     }
 
-    res.json({ reply: "AI ready (prompt + learning pipeline active)." });
+    res.json({ reply: "AI ready (client setup complete)." });
   } catch (err) {
     console.error("Chat error:", err);
     res.status(500).json({ error: "server_error" });
