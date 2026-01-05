@@ -26,6 +26,7 @@ const PORT = process.env.PORT || 3000;
 const OPENAI_API_KEY = process.env.OPENAI_API_KEY;
 const DATABASE_URL = process.env.DATABASE_URL;
 const JWT_SECRET = process.env.ADMIN_JWT_SECRET;
+const BASE_URL = "https://mascot.academictechnexus.com";
 
 /* ================= MIDDLEWARE ================= */
 app.use(cors({ origin: true, credentials: true }));
@@ -47,12 +48,12 @@ app.use((req, _, next) => {
 });
 
 /* ======================================================
-   ADMIN ROUTER (🔥 IMPORTANT FIX — UNCHANGED)
+   ADMIN ROUTER (UNCHANGED)
 ====================================================== */
 const adminRouter = express.Router();
 app.use("/admin", adminRouter);
 
-/* ================= ADMIN AUTH (UNCHANGED) ================= */
+/* ================= ADMIN AUTH ================= */
 
 adminRouter.post("/auth/login", async (req, res) => {
   try {
@@ -93,7 +94,7 @@ adminRouter.get("/me", adminAuth, (req, res) => {
   res.json({ success: true, admin: req.admin });
 });
 
-/* ================= ADMIN ANALYTICS (UNCHANGED) ================= */
+/* ================= ADMIN ANALYTICS ================= */
 
 adminRouter.get("/analytics/overview", adminAuth, async (req, res) => {
   try {
@@ -126,7 +127,7 @@ adminRouter.get("/analytics/overview", adminAuth, async (req, res) => {
   }
 });
 
-/* ================= GLOBAL SETTINGS (UNCHANGED) ================= */
+/* ================= GLOBAL SETTINGS ================= */
 
 adminRouter.get("/settings", adminAuth, async (_, res) => {
   const { rows } = await db.query("SELECT * FROM global_settings LIMIT 1");
@@ -176,16 +177,52 @@ adminRouter.put("/settings", adminAuth, async (req, res) => {
   }
 });
 
-/* ================= SITE MANAGEMENT (UNCHANGED) ================= */
+/* ================= SITE MANAGEMENT ================= */
 
+/* ---------- Helper: embed script generator (ADDED) ---------- */
+function generateEmbedScript(domain) {
+  return `<script>
+(function(){
+  var s=document.createElement("script");
+  s.src="${BASE_URL}/chatbot-widget.js";
+  s.async=true;
+  s.setAttribute("data-site","${domain}");
+  document.head.appendChild(s);
+})();
+</script>`;
+}
+
+/* ---------- Helper: create setup token (ADDED) ---------- */
+async function createClientSetupToken(siteId) {
+  const token = crypto.randomBytes(24).toString("hex");
+  await db.query(
+    `INSERT INTO client_setup_tokens (id, site_id, token)
+     VALUES ($1,$2,$3)`,
+    [crypto.randomUUID(), siteId, token]
+  );
+  return token;
+}
+
+/* ---------- LIST SITES (EXTENDED, SAFE) ---------- */
 adminRouter.get("/sites", adminAuth, async (req, res) => {
   const { rows } = await db.query(
     `SELECT id, name, domain, plan, daily_quota, status, setup_completed, created_at
      FROM sites ORDER BY created_at DESC`
   );
-  res.json(rows);
+
+  const enriched = rows.map(site => {
+    const setupLink = `${BASE_URL}/client-setup/${site.id}`;
+    return {
+      ...site,
+      client_setup_link: `${BASE_URL}/client-setup/${site.id}`,
+      embed_script: generateEmbedScript(site.domain)
+    };
+  });
+
+  res.json(enriched);
 });
 
+/* ---------- CREATE SITE (EXTENDED, SAFE) ---------- */
 adminRouter.post("/sites", adminAuth, async (req, res) => {
   try {
     let finalDomain = (req.body.domain || req.body.url || "")
@@ -214,7 +251,16 @@ adminRouter.post("/sites", adminAuth, async (req, res) => {
       ]
     );
 
-    res.json({ success: true, site: siteResult.rows[0] });
+    const setupToken = await createClientSetupToken(siteId);
+    const setupLink = `${BASE_URL}/client-setup/${setupToken}`;
+    const embedScript = generateEmbedScript(finalDomain);
+
+    res.json({
+      success: true,
+      site: siteResult.rows[0],
+      client_setup_link: setupLink,
+      embed_script: embedScript
+    });
   } catch (err) {
     console.error("Create site error:", err);
     res.status(500).json({ error: "server_error" });
@@ -222,21 +268,9 @@ adminRouter.post("/sites", adminAuth, async (req, res) => {
 });
 
 /* ======================================================
-   🆕 CLIENT SETUP TOKEN + PUBLIC SETUP (APPENDED ONLY)
+   CLIENT SETUP — PUBLIC (UNCHANGED)
 ====================================================== */
 
-/* ---------- Token generator (added) ---------- */
-async function createClientSetupToken(siteId) {
-  const token = crypto.randomBytes(24).toString("hex");
-  await db.query(
-    `INSERT INTO client_setup_tokens (id, site_id, token)
-     VALUES ($1,$2,$3)`,
-    [crypto.randomUUID(), siteId, token]
-  );
-  return token;
-}
-
-/* ---------- Resolve site by token (added) ---------- */
 async function resolveSiteByToken(token) {
   const { rows } = await db.query(
     `SELECT s.*
@@ -247,8 +281,6 @@ async function resolveSiteByToken(token) {
   );
   return rows[0];
 }
-
-/* ---------- Public client setup routes (added) ---------- */
 
 app.get("/client-setup/:token", async (req, res) => {
   try {
@@ -329,7 +361,7 @@ app.post(
   }
 );
 
-/* ================= CHAT (UNCHANGED) ================= */
+/* ================= CHAT ================= */
 
 app.post("/chat", async (req, res) => {
   try {
