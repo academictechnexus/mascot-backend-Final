@@ -427,3 +427,10 @@ clientAuthRouter.post("/register", async (req, res) => {
     res.status(500).json({ error: "server_error" });
   }
 });
+/* ======================================================
+   START SERVER (REQUIRED FOR RAILWAY)
+====================================================== */
+
+app.listen(PORT, () => {
+  console.log(`Mascot backend running on port ${PORT}`);
+});
