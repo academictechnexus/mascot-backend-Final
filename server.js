@@ -12,7 +12,7 @@ const jwt = require("jsonwebtoken");
 const { Pool } = require("pg");
 const { URL } = require("url");
 const crypto = require("crypto");
-const path = require("path"); // ✅ ADDED (STATIC FILE SUPPORT)
+const path = require("path");
 require("dotenv").config();
 
 const adminAuth = require("./middleware/adminAuth");
@@ -32,8 +32,8 @@ app.use(express.json({ limit: "1mb" }));
 app.use(helmet({ contentSecurityPolicy: false }));
 app.use(morgan("dev"));
 
-/* ================= STATIC FILES (ONLY FIX) ================= */
-app.use(express.static(path.join(__dirname, "public"))); // ✅ exposes /chatbot-widget.js
+/* ================= STATIC FILES ================= */
+app.use(express.static(path.join(__dirname, "public")));
 
 app.use("/chat", rateLimit({ windowMs: 10_000, max: 10 }));
 
@@ -46,8 +46,15 @@ app.use((req, _, next) => {
   next();
 });
 
-/* ================= ADMIN LOGIN ================= */
-app.post("/admin/auth/login", async (req, res) => {
+/* ======================================================
+   ADMIN ROUTER (🔥 IMPORTANT FIX)
+====================================================== */
+const adminRouter = express.Router();
+app.use("/admin", adminRouter);
+
+/* ================= ADMIN AUTH ================= */
+
+adminRouter.post("/auth/login", async (req, res) => {
   try {
     const { username, password } = req.body;
 
@@ -70,7 +77,11 @@ app.post("/admin/auth/login", async (req, res) => {
     res.json({
       success: true,
       token,
-      admin: { id: admin.id, username: admin.username, role: admin.role }
+      admin: {
+        id: admin.id,
+        username: admin.username,
+        role: admin.role
+      }
     });
   } catch (err) {
     console.error("Admin login error:", err);
@@ -78,14 +89,13 @@ app.post("/admin/auth/login", async (req, res) => {
   }
 });
 
-/* ================= ADMIN SESSION ================= */
-app.get("/admin/me", adminAuth, (req, res) => {
+adminRouter.get("/me", adminAuth, (req, res) => {
   res.json({ success: true, admin: req.admin });
 });
 
 /* ================= ADMIN ANALYTICS ================= */
 
-app.get("/admin/analytics/overview", adminAuth, async (req, res) => {
+adminRouter.get("/analytics/overview", adminAuth, async (req, res) => {
   try {
     const today = new Date().toISOString().slice(0, 10);
 
@@ -120,42 +130,14 @@ app.get("/admin/analytics/overview", adminAuth, async (req, res) => {
   }
 });
 
-app.get("/admin/analytics/sites", adminAuth, async (req, res) => {
-  try {
-    const today = new Date().toISOString().slice(0, 10);
-
-    const { rows } = await db.query(
-      `
-      SELECT
-        s.id,
-        s.domain,
-        s.plan,
-        s.daily_quota,
-        s.status,
-        COALESCE(u.count, 0) AS usage_today
-      FROM sites s
-      LEFT JOIN usage_daily u
-        ON u.site_id = s.id AND u.date = $1
-      ORDER BY usage_today DESC
-      `,
-      [today]
-    );
-
-    res.json(rows);
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ error: "server_error" });
-  }
-});
-
 /* ================= GLOBAL SETTINGS ================= */
 
-app.get("/admin/settings", adminAuth, async (_, res) => {
+adminRouter.get("/settings", adminAuth, async (_, res) => {
   const { rows } = await db.query("SELECT * FROM global_settings LIMIT 1");
   res.json(rows[0]);
 });
 
-app.put("/admin/settings", adminAuth, async (req, res) => {
+adminRouter.put("/settings", adminAuth, async (req, res) => {
   try {
     const allowed = [
       "demo_days",
@@ -184,12 +166,11 @@ app.put("/admin/settings", adminAuth, async (req, res) => {
       return res.status(400).json({ error: "no_valid_fields" });
     }
 
-    values.push(true);
-
     await db.query(
       `UPDATE global_settings
        SET ${fields.join(", ")}, updated_at=NOW()
-       WHERE id=$${i}`,
+       WHERE id=1`
+      ,
       values
     );
 
@@ -200,10 +181,27 @@ app.put("/admin/settings", adminAuth, async (req, res) => {
   }
 });
 
-/* ================= SITE MANAGEMENT ================= */
+/* ======================================================
+   ✅ SITE MANAGEMENT (THIS WAS MISSING)
+====================================================== */
 
-// Create site (Option-B compatible)
-app.post("/admin/sites", adminAuth, async (req, res) => {
+// LIST SITES ✅
+adminRouter.get("/sites", adminAuth, async (req, res) => {
+  try {
+    const { rows } = await db.query(
+      `SELECT id, name, domain, plan, daily_quota, status, created_at
+       FROM sites
+       ORDER BY created_at DESC`
+    );
+    res.json(rows);
+  } catch (err) {
+    console.error("List sites error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// CREATE SITE ✅
+adminRouter.post("/sites", adminAuth, async (req, res) => {
   try {
     const {
       name,
@@ -212,8 +210,7 @@ app.post("/admin/sites", adminAuth, async (req, res) => {
       url,
       plan,
       daily_quota,
-      status,
-      webhook_url
+      status
     } = req.body;
 
     let finalDomain = domain || url;
@@ -231,34 +228,20 @@ app.post("/admin/sites", adminAuth, async (req, res) => {
       (finalDomain ? finalDomain.split(".")[0] : null);
 
     if (!finalName || !finalDomain) {
-      return res.status(400).json({
-        error: "missing_required_fields",
-        required: ["domain"]
-      });
+      return res.status(400).json({ error: "missing_required_fields" });
     }
 
     const result = await db.query(
-      `
-      INSERT INTO sites (
-        id,
-        name,
-        domain,
-        plan,
-        daily_quota,
-        status,
-        webhook_url
-      )
-      VALUES ($1,$2,$3,$4,$5,$6,$7)
-      RETURNING *
-      `,
+      `INSERT INTO sites (id, name, domain, plan, daily_quota, status)
+       VALUES ($1,$2,$3,$4,$5,$6)
+       RETURNING *`,
       [
         crypto.randomUUID(),
-        finalName.trim(),
+        finalName,
         finalDomain,
-        plan || "free",
-        Number(daily_quota) || 100,
-        status || "active",
-        webhook_url || null
+        plan || "demo",
+        Number(daily_quota) || 50,
+        status || "active"
       ]
     );
 
@@ -268,6 +251,27 @@ app.post("/admin/sites", adminAuth, async (req, res) => {
       return res.status(400).json({ error: "site_already_exists" });
     }
     console.error("Create site error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
+
+// UPDATE SITE (EDIT / ENABLE / DISABLE) ✅
+adminRouter.put("/sites/:id", adminAuth, async (req, res) => {
+  try {
+    const { plan, daily_quota, status } = req.body;
+
+    await db.query(
+      `UPDATE sites
+       SET plan=$1,
+           daily_quota=$2,
+           status=$3
+       WHERE id=$4`,
+      [plan, Number(daily_quota), status, req.params.id]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Update site error:", err);
     res.status(500).json({ error: "server_error" });
   }
 });
