@@ -179,7 +179,7 @@ adminRouter.put("/settings", adminAuth, async (req, res) => {
 
 /* ================= SITE MANAGEMENT ================= */
 
-/* ---------- Helper: embed script generator (ADDED) ---------- */
+/* ---------- Helper: embed script generator ---------- */
 function generateEmbedScript(domain) {
   return `<script>
 (function(){
@@ -192,7 +192,7 @@ function generateEmbedScript(domain) {
 </script>`;
 }
 
-/* ---------- Helper: create setup token (ADDED) ---------- */
+/* ---------- Helper: create setup token ---------- */
 async function createClientSetupToken(siteId) {
   const token = crypto.randomBytes(24).toString("hex");
   await db.query(
@@ -203,29 +203,39 @@ async function createClientSetupToken(siteId) {
   return token;
 }
 
-/* ---------- LIST SITES (EXTENDED, SAFE) ---------- */
+/* ---------- Resolve site by token ---------- */
+async function resolveSiteByToken(token) {
+  const { rows } = await db.query(
+    `SELECT s.*
+     FROM client_setup_tokens t
+     JOIN sites s ON s.id = t.site_id
+     WHERE t.token=$1`,
+    [token]
+  );
+  return rows[0];
+}
+
+/* ---------- LIST SITES ---------- */
 adminRouter.get("/sites", adminAuth, async (req, res) => {
   const { rows } = await db.query(
-    `SELECT id, name, domain, plan, daily_quota, status, setup_completed, created_at
+    `SELECT id, name, domain, plan, daily_quota, status,
+            setup_completed, created_at
      FROM sites ORDER BY created_at DESC`
   );
 
-  const enriched = rows.map(site => {
-    const setupLink = `${BASE_URL}/client-setup/${site.id}`;
-    return {
+  res.json(
+    rows.map(site => ({
       ...site,
       client_setup_link: `${BASE_URL}/client-setup/${site.id}`,
       embed_script: generateEmbedScript(site.domain)
-    };
-  });
-
-  res.json(enriched);
+    }))
+  );
 });
 
-/* ---------- CREATE SITE (EXTENDED, SAFE) ---------- */
+/* ---------- CREATE SITE ---------- */
 adminRouter.post("/sites", adminAuth, async (req, res) => {
   try {
-    let finalDomain = (req.body.domain || req.body.url || "")
+    let finalDomain = (req.body.domain || "")
       .replace(/^https?:\/\//, "")
       .replace(/\/$/, "")
       .toLowerCase()
@@ -252,62 +262,48 @@ adminRouter.post("/sites", adminAuth, async (req, res) => {
     );
 
     const setupToken = await createClientSetupToken(siteId);
-    const setupLink = `${BASE_URL}/client-setup/${setupToken}`;
-    const embedScript = generateEmbedScript(finalDomain);
 
     res.json({
       success: true,
       site: siteResult.rows[0],
-      client_setup_link: setupLink,
-      embed_script: embedScript
+      client_setup_link: `${BASE_URL}/client-setup/${setupToken}`,
+      embed_script: generateEmbedScript(finalDomain)
     });
   } catch (err) {
     console.error("Create site error:", err);
     res.status(500).json({ error: "server_error" });
   }
 });
-
 /* ======================================================
-   CLIENT SETUP — PUBLIC (UNCHANGED)
+   CLIENT SETUP — QUESTIONS (APPENDED)
 ====================================================== */
 
-async function resolveSiteByToken(token) {
-  const { rows } = await db.query(
-    `SELECT s.*
-     FROM client_setup_tokens t
-     JOIN sites s ON s.id = t.site_id
-     WHERE t.token=$1`,
-    [token]
-  );
-  return rows[0];
-}
-
-app.get("/client-setup/:token", async (req, res) => {
+app.get("/client-setup/:token/questions", async (req, res) => {
   try {
     const site = await resolveSiteByToken(req.params.token);
-    if (!site) {
-      return res.status(404).json({ error: "invalid_token" });
-    }
+    if (!site) return res.status(404).json({ error: "invalid_token" });
 
-    res.json({
-      site: {
-        id: site.id,
-        domain: site.domain,
-        setup_completed: site.setup_completed
-      }
-    });
+    const { rows } = await db.query(
+      `SELECT key, label, type, required, order_no
+       FROM setup_questions
+       ORDER BY order_no ASC`
+    );
+
+    res.json({ questions: rows });
   } catch (err) {
-    console.error("Client setup fetch error:", err);
+    console.error("Fetch setup questions error:", err);
     res.status(500).json({ error: "server_error" });
   }
 });
 
+/* ======================================================
+   CLIENT SETUP — SAVE ANSWERS (APPENDED)
+====================================================== */
+
 app.post("/client-setup/:token/setup", async (req, res) => {
   try {
     const site = await resolveSiteByToken(req.params.token);
-    if (!site) {
-      return res.status(404).json({ error: "invalid_token" });
-    }
+    if (!site) return res.status(404).json({ error: "invalid_token" });
 
     const answers = req.body.answers || {};
 
@@ -328,10 +324,14 @@ app.post("/client-setup/:token/setup", async (req, res) => {
 
     res.json({ success: true });
   } catch (err) {
-    console.error("Client setup save error:", err);
+    console.error("Save setup answers error:", err);
     res.status(500).json({ error: "server_error" });
   }
 });
+
+/* ======================================================
+   CLIENT SETUP — DOCUMENT UPLOAD (APPENDED)
+====================================================== */
 
 const clientUpload = multer({ limits: { fileSize: 5 * 1024 * 1024 } });
 
@@ -341,9 +341,7 @@ app.post(
   async (req, res) => {
     try {
       const site = await resolveSiteByToken(req.params.token);
-      if (!site) {
-        return res.status(404).json({ error: "invalid_token" });
-      }
+      if (!site) return res.status(404).json({ error: "invalid_token" });
 
       for (const file of req.files || []) {
         await db.query(
@@ -360,49 +358,3 @@ app.post(
     }
   }
 );
-
-/* ================= CHAT ================= */
-
-app.post("/chat", async (req, res) => {
-  try {
-    const siteDomain =
-      req.body.site ||
-      (req.headers.origin ? new URL(req.headers.origin).hostname : null);
-
-    if (!siteDomain) {
-      return res.status(400).json({ error: "unknown_site" });
-    }
-
-    const siteRes = await db.query(
-      "SELECT * FROM sites WHERE domain=$1",
-      [siteDomain]
-    );
-    const site = siteRes.rows[0];
-
-    if (!site) {
-      return res.status(403).json({ error: "site_not_registered" });
-    }
-
-    if (!site.setup_completed) {
-      return res.json({
-        reply: "Assistant is currently being configured. Please check back soon."
-      });
-    }
-
-    res.json({ reply: "AI ready (client setup complete)." });
-  } catch (err) {
-    console.error("Chat error:", err);
-    res.status(500).json({ error: "server_error" });
-  }
-});
-
-/* ================= HEALTH ================= */
-app.get("/", (_, res) => res.send("OK"));
-app.get("/health", (_, res) =>
-  res.json({ ok: true, time: new Date().toISOString() })
-);
-
-/* ================= START ================= */
-app.listen(PORT, () => {
-  console.log(`✅ Mascot backend running on port ${PORT}`);
-});
