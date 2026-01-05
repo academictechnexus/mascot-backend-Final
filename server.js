@@ -434,3 +434,37 @@ clientAuthRouter.post("/register", async (req, res) => {
 app.listen(PORT, () => {
   console.log(`Mascot backend running on port ${PORT}`);
 });
+/* ======================================================
+   ADMIN — UPDATE SITE STATUS (APPENDED)
+====================================================== */
+
+adminRouter.put("/sites/:id/status", adminAuth, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { status } = req.body;
+
+    if (!["active", "disabled"].includes(status)) {
+      return res.status(400).json({ error: "invalid_status" });
+    }
+
+    const result = await db.query(
+      `UPDATE sites
+       SET status = $1, updated_at = NOW()
+       WHERE id = $2
+       RETURNING id, status`,
+      [status, id]
+    );
+
+    if (result.rowCount === 0) {
+      return res.status(404).json({ error: "site_not_found" });
+    }
+
+    res.json({
+      success: true,
+      site: result.rows[0]
+    });
+  } catch (err) {
+    console.error("Update site status error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
