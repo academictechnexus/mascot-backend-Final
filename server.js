@@ -358,3 +358,72 @@ app.post(
     }
   }
 );
+/* ======================================================
+   CLIENT AUTH — REGISTER CLIENT ADMIN (APPENDED)
+   Purpose:
+   - Allow business owner to create login AFTER setup
+   - Bound strictly to site_id via setup token
+====================================================== */
+
+const clientAuthRouter = express.Router();
+app.use("/client-auth", clientAuthRouter);
+
+/*
+  POST /client-auth/register
+  Body:
+  {
+    token,
+    email,
+    password
+  }
+*/
+clientAuthRouter.post("/register", async (req, res) => {
+  try {
+    const { token, email, password } = req.body;
+
+    if (!token || !email || !password) {
+      return res.status(400).json({ error: "missing_fields" });
+    }
+
+    // 1. Resolve site using setup token
+    const site = await resolveSiteByToken(token);
+    if (!site) {
+      return res.status(400).json({ error: "invalid_token" });
+    }
+
+    // 2. Ensure setup is completed
+    if (!site.setup_completed) {
+      return res.status(400).json({ error: "setup_not_completed" });
+    }
+
+    // 3. Check if client user already exists for this site
+    const existing = await db.query(
+      `SELECT id FROM client_users WHERE site_id=$1 LIMIT 1`,
+      [site.id]
+    );
+
+    if (existing.rowCount > 0) {
+      return res.status(409).json({ error: "client_user_exists" });
+    }
+
+    // 4. Hash password
+    const passwordHash = await bcrypt.hash(password, 10);
+
+    // 5. Create client admin user
+    await db.query(
+      `INSERT INTO client_users (id, site_id, email, password_hash, created_at)
+       VALUES ($1,$2,$3,$4,NOW())`,
+      [
+        crypto.randomUUID(),
+        site.id,
+        email.toLowerCase().trim(),
+        passwordHash
+      ]
+    );
+
+    res.json({ success: true });
+  } catch (err) {
+    console.error("Client register error:", err);
+    res.status(500).json({ error: "server_error" });
+  }
+});
