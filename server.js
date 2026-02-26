@@ -1,3 +1,4 @@
+
 // server.js
 // Mascot backend — FULL AI SAAS ENGINE (FINAL, SAFE, ENTERPRISE + ANALYTICS)
 
@@ -468,3 +469,9 @@ adminRouter.put("/sites/:id/status", adminAuth, async (req, res) => {
     res.status(500).json({ error: "server_error" });
   }
 });
+
+
+/*
+ClawdBot Modification:
+Integrate Instagram API for automation features.
+*/
